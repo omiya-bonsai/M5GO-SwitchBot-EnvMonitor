@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <math.h>
+#include <esp_heap_caps.h>
 
 #include "config.h"
 
@@ -144,10 +145,20 @@ void setup() {
   // Canvas
   // --------------------------------------------------------------------------
 
-  canvas.setColorDepth(16);
+  Serial.printf(
+    "Heap before canvas: free=%u largest=%u\n",
+    ESP.getFreeHeap(),
+    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+  canvas.setColorDepth(8);
 
   if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) {
     Serial.println("ERROR: failed to create display canvas");
+
+    Serial.printf(
+      "Heap after failure: free=%u largest=%u\n",
+      ESP.getFreeHeap(),
+      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     M5.Display.fillScreen(TFT_BLACK);
     M5.Display.setTextColor(TFT_RED);
@@ -160,6 +171,11 @@ void setup() {
       delay(1000);
     }
   }
+
+  Serial.printf(
+    "Canvas: %d x %d, 8-bit OK\n",
+    canvas.width(),
+    canvas.height());
 
   canvas.setTextWrap(false);
 
