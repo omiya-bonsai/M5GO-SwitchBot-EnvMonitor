@@ -4,18 +4,18 @@
 // Wi-Fi
 // ============================================================================
 
-#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
 // ============================================================================
 // MQTT
 // ============================================================================
 
-#define MQTT_HOST "192.168.0.10"
+#define MQTT_HOST "192.168.3.200"
 #define MQTT_PORT 1883
 
-#define MQTT_USERNAME ""
-#define MQTT_PASSWORD ""
+#define MQTT_USERNAME "YOUR_MQTT_USERNAME"
+#define MQTT_PASSWORD "YOUR_MQTT_PASSWORD"
 
 #define MQTT_CLIENT_ID "m5go-switchbot-b3d8"
 
