@@ -1,0 +1,37 @@
+# Local configuration with secrets / environment-specific values
+config.h
+
+# macOS
+.DS_Store
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+
+# Arduino / PlatformIO build artifacts
+build/
+dist/
+out/
+*.o
+*.obj
+*.d
+*.a
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# PlatformIO
+.pio/
+.piolibdeps/
+
+# VS Code workspace-local settings
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/launch.json
+.vscode/*.code-snippets
+
+# Logs
+*.log
