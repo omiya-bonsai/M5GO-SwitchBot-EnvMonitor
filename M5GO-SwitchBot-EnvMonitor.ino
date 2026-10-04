@@ -2,976 +2,117 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <time.h>
 #include <math.h>
 #include <esp_heap_caps.h>
-
 #include "config.h"
 
-// ============================================================================
-// Application
-// ============================================================================
+#if __has_include("JetBrainsMono9pt7b.h") && __has_include("JetBrainsMono12pt7b.h") && __has_include("JetBrainsMono24pt7b.h")
+  #include "JetBrainsMono9pt7b.h"
+  #include "JetBrainsMono12pt7b.h"
+  #include "JetBrainsMono24pt7b.h"
+  #define HAVE_JETBRAINS_MONO 1
+#else
+  #define HAVE_JETBRAINS_MONO 0
+#endif
 
 static constexpr char APP_NAME[] = "M5GO-SwitchBot-EnvMonitor";
-static constexpr char APP_VERSION[] = "0.2.0";
-
-// ============================================================================
-// Display
-// ============================================================================
-
-static constexpr int SCREEN_W = 320;
-static constexpr int SCREEN_H = 240;
-
-// Omarchy-inspired palette (RGB565)
-static constexpr uint16_t COLOR_BG = 0x1082;
-static constexpr uint16_t COLOR_PANEL = 0x18E3;
-static constexpr uint16_t COLOR_TEXT = 0xE71C;
-static constexpr uint16_t COLOR_MUTED = 0x8410;
-static constexpr uint16_t COLOR_CYAN = 0x05DB;
-static constexpr uint16_t COLOR_ORANGE = 0xFC60;
-static constexpr uint16_t COLOR_PURPLE = 0xB29F;
-static constexpr uint16_t COLOR_GREEN = 0x5E8B;
-static constexpr uint16_t COLOR_YELLOW = 0xDDA0;
-static constexpr uint16_t COLOR_RED = 0xE986;
-static constexpr uint16_t COLOR_DIVIDER = 0x3186;
-
-// Full-screen off-screen buffer.
-//
-// Everything is rendered here first and transferred to the LCD in one pass.
-// This eliminates most of the visible flicker caused by repeatedly clearing
-// and drawing directly to the physical LCD.
+static constexpr char APP_VERSION[] = "0.3.1";
+static constexpr int SCREEN_W = 320, SCREEN_H = 240;
+static constexpr uint16_t COLOR_BG=0x1082, COLOR_TEXT=0xE71C, COLOR_MUTED=0x8410;
+static constexpr uint16_t COLOR_CYAN=0x05DB, COLOR_ORANGE=0xFC60, COLOR_PURPLE=0xB29F;
+static constexpr uint16_t COLOR_GREEN=0x5E8B, COLOR_YELLOW=0xDDA0, COLOR_RED=0xE986, COLOR_DIVIDER=0x3186;
 M5Canvas canvas(&M5.Display);
 
-// ============================================================================
-// Timing
-// ============================================================================
-
-static constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
-static constexpr uint32_t MQTT_RETRY_INTERVAL_MS = 5000;
-
-// One frame per second is sufficient because the only continuously changing
-// information is the clock/data age.
-static constexpr uint32_t DISPLAY_INTERVAL_MS = 1000;
-
-// Provisional freshness thresholds.
-//
-// These describe how long it has been since this M5GO received the MQTT
-// message. Later we can use a timestamp supplied by Home Assistant instead.
-static constexpr uint32_t DATA_STALE_SEC = 180;
-static constexpr uint32_t DATA_OFFLINE_SEC = 600;
-
-// ============================================================================
-// Runtime state
-// ============================================================================
-
+enum class Page { MAIN, STATUS };
+Page currentPage = Page::MAIN;
+static constexpr uint32_t DISPLAY_SLEEP_MS=180000UL, LONG_PRESS_MS=800UL;
+static constexpr uint32_t WIFI_RETRY_INTERVAL_MS=10000UL, MQTT_RETRY_INTERVAL_MS=5000UL, DISPLAY_INTERVAL_MS=1000UL;
+static constexpr uint32_t DATA_STALE_SEC=180, DATA_OFFLINE_SEC=600;
+bool displaySleeping=false;
+uint32_t lastUserActivityMs=0;
+static constexpr uint8_t BRIGHTNESS_LEVELS[]={40,80,120,160,220};
+static constexpr size_t BRIGHTNESS_LEVEL_COUNT=sizeof(BRIGHTNESS_LEVELS)/sizeof(BRIGHTNESS_LEVELS[0]);
+uint8_t brightnessIndex=3;
+Preferences preferences;
+struct ButtonState { bool previousPressed=false; bool longActionDone=false; uint32_t pressedAt=0; };
+ButtonState buttonA,buttonB,buttonC;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-
-float temperature = NAN;
-float humidity = NAN;
-
-bool hasSensorData = false;
-bool ntpReady = false;
-
-time_t lastDataReceivedAt = 0;
-
-uint32_t lastWifiAttemptMs = 0;
-uint32_t lastMqttAttemptMs = 0;
-uint32_t lastDisplayMs = 0;
-
-// ============================================================================
-// Forward declarations
-// ============================================================================
-
-void connectWiFi();
-void maintainWiFi();
-
-void setupTime();
-void updateTimeState();
-bool isTimeValid();
-
-void setupMQTT();
-void maintainMQTT();
-void mqttCallback(char* topic, byte* payload, unsigned int length);
+float temperature=NAN, humidity=NAN;
+bool hasSensorData=false, ntpReady=false;
+time_t lastDataReceivedAt=0;
+uint32_t lastWifiAttemptMs=0,lastMqttAttemptMs=0,lastDisplayMs=0;
 
 void drawScreen();
-void drawHeader();
-void drawEnvironment();
-void drawFooter();
 
-String getTimeString();
-String getDateString();
-String getDataAgeString();
-String getDataStateString();
-
-uint16_t getDataStateColor();
-
-// ============================================================================
-// Setup
-// ============================================================================
-
-void setup() {
-  // --------------------------------------------------------------------------
-  // M5Unified
-  // --------------------------------------------------------------------------
-
-  auto cfg = M5.config();
-
-  M5.begin(cfg);
-
-  // Landscape 320 x 240.
-  M5.Display.setRotation(1);
-  M5.Display.setBrightness(160);
-
-  // --------------------------------------------------------------------------
-  // Serial
-  // --------------------------------------------------------------------------
-
-  Serial.begin(115200);
-  delay(100);
-
-  Serial.println();
-  Serial.println("========================================");
-  Serial.printf(" %s\n", APP_NAME);
-  Serial.printf(" version %s\n", APP_VERSION);
-  Serial.println("========================================");
-
-  Serial.printf(
-    "Display: %d x %d\n",
-    M5.Display.width(),
-    M5.Display.height());
-
-  // --------------------------------------------------------------------------
-  // Canvas
-  // --------------------------------------------------------------------------
-
-  Serial.printf(
-    "Heap before canvas: free=%u largest=%u\n",
-    ESP.getFreeHeap(),
-    heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-  canvas.setColorDepth(8);
-
-  if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) {
-    Serial.println("ERROR: failed to create display canvas");
-
-    Serial.printf(
-      "Heap after failure: free=%u largest=%u\n",
-      ESP.getFreeHeap(),
-      heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-    M5.Display.fillScreen(TFT_BLACK);
-    M5.Display.setTextColor(TFT_RED);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 10);
-    M5.Display.println("Canvas allocation");
-    M5.Display.println("failed.");
-
-    while (true) {
-      delay(1000);
-    }
-  }
-
-  Serial.printf(
-    "Canvas: %d x %d, 8-bit OK\n",
-    canvas.width(),
-    canvas.height());
-
-  canvas.setTextWrap(false);
-
-  drawScreen();
-
-  // --------------------------------------------------------------------------
-  // Wi-Fi
-  // --------------------------------------------------------------------------
-
-  connectWiFi();
-
-  // --------------------------------------------------------------------------
-  // NTP
-  // --------------------------------------------------------------------------
-
-  setupTime();
-
-  // --------------------------------------------------------------------------
-  // MQTT
-  // --------------------------------------------------------------------------
-
-  setupMQTT();
-
-  drawScreen();
+void setSmallFont(){
+#if HAVE_JETBRAINS_MONO
+  canvas.setFont(&JetBrainsMono9pt7b);
+#else
+  canvas.setFont(&fonts::FreeMono9pt7b);
+#endif
 }
-
-// ============================================================================
-// Main loop
-// ============================================================================
-
-void loop() {
-  M5.update();
-
-  maintainWiFi();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    updateTimeState();
-
-    maintainMQTT();
-
-    if (mqttClient.connected()) {
-      mqttClient.loop();
-    }
-  }
-
-  const uint32_t nowMs = millis();
-
-  if (nowMs - lastDisplayMs >= DISPLAY_INTERVAL_MS) {
-    lastDisplayMs = nowMs;
-    drawScreen();
-  }
-
-  delay(5);
+void setMediumFont(){
+#if HAVE_JETBRAINS_MONO
+  canvas.setFont(&JetBrainsMono12pt7b);
+#else
+  canvas.setFont(&fonts::FreeMonoBold12pt7b);
+#endif
 }
-
-// ============================================================================
-// Wi-Fi
-// ============================================================================
-
-void connectWiFi() {
-  Serial.printf("WiFi: connecting to %s\n", WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  const uint32_t startedAt = millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
-    delay(250);
-    Serial.print(".");
-  }
-
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi: connected");
-
-    Serial.print("WiFi: IP = ");
-    Serial.println(WiFi.localIP());
-
-    Serial.printf(
-      "WiFi: RSSI = %d dBm\n",
-      WiFi.RSSI());
-
-    lastWifiAttemptMs = millis();
-
-    drawScreen();
-    return;
-  }
-
-  Serial.println("WiFi: initial connection failed");
-
-  lastWifiAttemptMs = millis();
-
-  drawScreen();
+void setLargeFont(){
+#if HAVE_JETBRAINS_MONO
+  canvas.setFont(&JetBrainsMono24pt7b);
+#else
+  canvas.setFont(&fonts::FreeMonoBold24pt7b);
+#endif
 }
+void drawTextSmall(const String&t,int x,int y,textdatum_t d,uint16_t c){canvas.setTextDatum(d);canvas.setTextColor(c);setSmallFont();canvas.drawString(t,x,y);}
+void drawTextMedium(const String&t,int x,int y,textdatum_t d,uint16_t c){canvas.setTextDatum(d);canvas.setTextColor(c);setMediumFont();canvas.drawString(t,x,y);}
+void drawTextLarge(const String&t,int x,int y,textdatum_t d,uint16_t c){canvas.setTextDatum(d);canvas.setTextColor(c);setLargeFont();canvas.drawString(t,x,y);}
 
-void maintainWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
+bool isTimeValid(){return time(nullptr)>1704067200;}
+String getTimeString(){struct tm t;if(!getLocalTime(&t,10))return "--:--";char b[8];snprintf(b,sizeof(b),"%02d:%02d",t.tm_hour,t.tm_min);return b;}
+String getDateString(){struct tm t;if(!getLocalTime(&t,10))return "--/--";char b[8];snprintf(b,sizeof(b),"%02d/%02d",t.tm_mon+1,t.tm_mday);return b;}
+String getDataStateString(){if(!hasSensorData)return "WAIT";if(!isTimeValid()||!lastDataReceivedAt)return "LIVE";time_t n=time(nullptr);uint32_t a=n>=lastDataReceivedAt?(uint32_t)(n-lastDataReceivedAt):0;if(a<DATA_STALE_SEC)return "LIVE";if(a<DATA_OFFLINE_SEC)return "STALE";return "OFFLINE";}
+uint16_t getDataStateColor(){String s=getDataStateString();if(s=="LIVE")return COLOR_GREEN;if(s=="STALE")return COLOR_YELLOW;if(s=="OFFLINE")return COLOR_RED;return COLOR_PURPLE;}
+String getDataAgeString(){if(!hasSensorData)return "waiting";if(!isTimeValid()||!lastDataReceivedAt)return "received";time_t n=time(nullptr);uint32_t a=n>=lastDataReceivedAt?(uint32_t)(n-lastDataReceivedAt):0;if(a<60)return String(a)+"s ago";if(a<3600)return String(a/60)+"m ago";if(a<86400)return String(a/3600)+"h ago";return String(a/86400)+"d ago";}
+String getIPAddressString(){return WiFi.status()==WL_CONNECTED?WiFi.localIP().toString():"-";}
+String getUptimeString(){uint32_t s=millis()/1000UL,d=s/86400UL,h=(s%86400UL)/3600UL,m=(s%3600UL)/60UL;char b[24];if(d)snprintf(b,sizeof(b),"%lud %02luh",(unsigned long)d,(unsigned long)h);else snprintf(b,sizeof(b),"%luh %02lum",(unsigned long)h,(unsigned long)m);return b;}
 
-  const uint32_t nowMs = millis();
-
-  if (
-    nowMs - lastWifiAttemptMs < WIFI_RETRY_INTERVAL_MS) {
-    return;
-  }
-
-  lastWifiAttemptMs = nowMs;
-
-  Serial.println("WiFi: reconnecting...");
-
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+void drawHeader(){String title=currentPage==Page::MAIN?"ENV / B3D8":"SYSTEM STATUS";drawTextSmall(title,14,21,middle_left,COLOR_CYAN);drawTextSmall(isTimeValid()?getDateString()+" "+getTimeString():"--/-- --:--",306,21,middle_right,COLOR_TEXT);canvas.drawFastHLine(14,39,292,COLOR_DIVIDER);}
+void drawMainPage(){const int lx=82,rx=238;canvas.drawFastVLine(160,52,135,COLOR_DIVIDER);drawTextSmall("TEMPERATURE",lx,61,middle_center,COLOR_MUTED);drawTextSmall("HUMIDITY",rx,61,middle_center,COLOR_MUTED);char b[16];if(hasSensorData&&!isnan(temperature)){snprintf(b,sizeof(b),"%.1f",temperature);drawTextLarge(b,lx,119,middle_center,COLOR_ORANGE);}else drawTextLarge("--.-",lx,119,middle_center,COLOR_ORANGE);if(hasSensorData&&!isnan(humidity)){snprintf(b,sizeof(b),"%.0f",humidity);drawTextLarge(b,rx,119,middle_center,COLOR_CYAN);}else drawTextLarge("--",rx,119,middle_center,COLOR_CYAN);
+  // Draw degree symbol geometrically so the ASCII-subset font stays small.
+  canvas.drawCircle(lx-11,158,3,COLOR_ORANGE); drawTextMedium("C",lx+4,171,middle_center,COLOR_ORANGE); drawTextMedium("%",rx,171,middle_center,COLOR_CYAN);
 }
-
-// ============================================================================
-// NTP
-// ============================================================================
-
-void setupTime() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("NTP: WiFi unavailable, deferred");
-    return;
-  }
-
-  Serial.println("NTP: configuring");
-
-  configTzTime(
-    TZ_INFO,
-    NTP_SERVER_1,
-    NTP_SERVER_2,
-    NTP_SERVER_3);
-
-  struct tm timeInfo;
-
-  // Give SNTP a short opportunity to synchronize at startup,
-  // but never block forever.
-  for (int i = 0; i < 20; ++i) {
-    if (getLocalTime(&timeInfo, 250)) {
-      ntpReady = true;
-
-      Serial.printf(
-        "NTP: synchronized %04d-%02d-%02d "
-        "%02d:%02d:%02d\n",
-        timeInfo.tm_year + 1900,
-        timeInfo.tm_mon + 1,
-        timeInfo.tm_mday,
-        timeInfo.tm_hour,
-        timeInfo.tm_min,
-        timeInfo.tm_sec);
-
-      drawScreen();
-      return;
-    }
-
-    delay(250);
-  }
-
-  Serial.println("NTP: synchronization pending");
-}
-
-void updateTimeState() {
-  if (ntpReady) {
-    return;
-  }
-
-  if (isTimeValid()) {
-    ntpReady = true;
-
-    Serial.println("NTP: time became valid");
-
-    drawScreen();
-  }
-}
-
-bool isTimeValid() {
-  const time_t now = time(nullptr);
-
-  // 2024-01-01 00:00:00 UTC
-  return now > 1704067200;
-}
-
-// ============================================================================
-// MQTT
-// ============================================================================
-
-void setupMQTT() {
-  mqttClient.setServer(
-    MQTT_HOST,
-    MQTT_PORT);
-
-  mqttClient.setCallback(mqttCallback);
-
-  // More than enough for the small environment JSON.
-  mqttClient.setBufferSize(512);
-
-  maintainMQTT();
-}
-
-void maintainMQTT() {
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  if (mqttClient.connected()) {
-    return;
-  }
-
-  const uint32_t nowMs = millis();
-
-  if (
-    nowMs - lastMqttAttemptMs < MQTT_RETRY_INTERVAL_MS) {
-    return;
-  }
-
-  lastMqttAttemptMs = nowMs;
-
-  Serial.printf(
-    "MQTT: connecting to %s:%u\n",
-    MQTT_HOST,
-    MQTT_PORT);
-
-  bool connected = false;
-
-  if (strlen(MQTT_USERNAME) > 0) {
-    connected = mqttClient.connect(
-      MQTT_CLIENT_ID,
-      MQTT_USERNAME,
-      MQTT_PASSWORD);
-  } else {
-    connected = mqttClient.connect(
-      MQTT_CLIENT_ID);
-  }
-
-  if (!connected) {
-    Serial.printf(
-      "MQTT: connection failed, state=%d\n",
-      mqttClient.state());
-
-    drawScreen();
-    return;
-  }
-
-  Serial.println("MQTT: connected");
-
-  if (
-    mqttClient.subscribe(
-      MQTT_TOPIC_ENV,
-      0)) {
-    Serial.printf(
-      "MQTT: subscribed %s\n",
-      MQTT_TOPIC_ENV);
-  } else {
-    Serial.println("MQTT: subscribe failed");
-  }
-
-  drawScreen();
-}
-
-// ============================================================================
-// MQTT callback
-// ============================================================================
-
-void mqttCallback(
-  char* topic,
-  byte* payload,
-  unsigned int length) {
-  Serial.printf(
-    "MQTT: received topic=%s length=%u\n",
-    topic,
-    length);
-
-  if (
-    strcmp(
-      topic,
-      MQTT_TOPIC_ENV)
-    != 0) {
-    return;
-  }
-
-  JsonDocument doc;
-
-  const DeserializationError error =
-    deserializeJson(
-      doc,
-      payload,
-      length);
-
-  if (error) {
-    Serial.print("JSON: parse failed: ");
-    Serial.println(error.c_str());
-    return;
-  }
-
-  if (
-    !doc["temperature"].is<float>() && !doc["temperature"].is<int>()) {
-    Serial.println(
-      "JSON: temperature missing");
-    return;
-  }
-
-  if (
-    !doc["humidity"].is<float>() && !doc["humidity"].is<int>()) {
-    Serial.println(
-      "JSON: humidity missing");
-    return;
-  }
-
-  const float newTemperature =
-    doc["temperature"].as<float>();
-
-  const float newHumidity =
-    doc["humidity"].as<float>();
-
-  // --------------------------------------------------------------------------
-  // Sanity checks
-  // --------------------------------------------------------------------------
-
-  if (
-    newTemperature < -50.0f || newTemperature > 80.0f) {
-    Serial.println(
-      "JSON: temperature out of range");
-    return;
-  }
-
-  if (
-    newHumidity < 0.0f || newHumidity > 100.0f) {
-    Serial.println(
-      "JSON: humidity out of range");
-    return;
-  }
-
-  // --------------------------------------------------------------------------
-  // Update state
-  // --------------------------------------------------------------------------
-
-  temperature = newTemperature;
-  humidity = newHumidity;
-
-  hasSensorData = true;
-
-  if (isTimeValid()) {
-    lastDataReceivedAt = time(nullptr);
-  } else {
-    lastDataReceivedAt = 0;
-  }
-
-  Serial.printf(
-    "ENV: temperature=%.1f humidity=%.1f\n",
-    temperature,
-    humidity);
-
-  // Immediate visual update.
-  drawScreen();
-}
-
-// ============================================================================
-// Display
-// ============================================================================
-
-void drawScreen() {
-  // IMPORTANT:
-  //
-  // We clear the OFF-SCREEN canvas, not the physical LCD.
-  // The completed frame is pushed to the LCD only once at the end.
-
-  canvas.fillSprite(COLOR_BG);
-
-  drawHeader();
-  drawEnvironment();
-  drawFooter();
-
-  // One physical display transfer per frame.
-  canvas.pushSprite(0, 0);
-}
-
-// ============================================================================
-// Header
-// ============================================================================
-
-void drawHeader() {
-  // --------------------------------------------------------------------------
-  // Application / sensor name
-  // --------------------------------------------------------------------------
-
-  canvas.setTextDatum(middle_left);
-  canvas.setTextColor(COLOR_CYAN);
-
-  canvas.setFont(
-    &fonts::FreeMonoBold9pt7b);
-
-  canvas.drawString(
-    "ENV / B3D8",
-    14,
-    21);
-
-  // --------------------------------------------------------------------------
-  // Date and time
-  // --------------------------------------------------------------------------
-
-  canvas.setTextDatum(middle_right);
-  canvas.setTextColor(COLOR_TEXT);
-
-  canvas.setFont(
-    &fonts::FreeMono9pt7b);
-
-  String clockText;
-
-  if (isTimeValid()) {
-    clockText =
-      getDateString() + " " + getTimeString();
-  } else {
-    clockText =
-      "--/-- --:--";
-  }
-
-  canvas.drawString(
-    clockText,
-    SCREEN_W - 14,
-    21);
-
-  // --------------------------------------------------------------------------
-  // Divider
-  // --------------------------------------------------------------------------
-
-  canvas.drawFastHLine(
-    14,
-    39,
-    SCREEN_W - 28,
-    COLOR_DIVIDER);
-}
-
-// ============================================================================
-// Main environment area
-// ============================================================================
-
-void drawEnvironment() {
-  // Layout:
-  //
-  //     TEMPERATURE       HUMIDITY
-  //
-  //        24.9              62
-  //         °C                %
-  //
-  // The main numeric area uses almost the full width of the M5GO.
-
-  static constexpr int LEFT_CENTER_X = 82;
-  static constexpr int RIGHT_CENTER_X = 238;
-
-  static constexpr int LABEL_Y = 61;
-  static constexpr int VALUE_Y = 119;
-  static constexpr int UNIT_Y = 174;
-
-  // --------------------------------------------------------------------------
-  // Vertical separator
-  // --------------------------------------------------------------------------
-
-  canvas.drawFastVLine(
-    SCREEN_W / 2,
-    51,
-    137,
-    COLOR_DIVIDER);
-
-  // --------------------------------------------------------------------------
-  // Labels
-  // --------------------------------------------------------------------------
-
-  canvas.setTextDatum(middle_center);
-
-  canvas.setFont(
-    &fonts::FreeMonoBold9pt7b);
-
-  canvas.setTextColor(
-    COLOR_MUTED);
-
-  canvas.drawString(
-    "TEMPERATURE",
-    LEFT_CENTER_X,
-    LABEL_Y);
-
-  canvas.drawString(
-    "HUMIDITY",
-    RIGHT_CENTER_X,
-    LABEL_Y);
-
-  // --------------------------------------------------------------------------
-  // Temperature value
-  // --------------------------------------------------------------------------
-
-  canvas.setTextColor(
-    COLOR_ORANGE);
-
-  canvas.setFont(
-    &fonts::FreeMonoBold24pt7b);
-
-  if (
-    hasSensorData && !isnan(temperature)) {
-    char buffer[16];
-
-    snprintf(
-      buffer,
-      sizeof(buffer),
-      "%.1f",
-      temperature);
-
-    canvas.drawString(
-      buffer,
-      LEFT_CENTER_X,
-      VALUE_Y);
-  } else {
-    canvas.drawString(
-      "--.-",
-      LEFT_CENTER_X,
-      VALUE_Y);
-  }
-
-  // --------------------------------------------------------------------------
-  // Humidity value
-  // --------------------------------------------------------------------------
-
-  canvas.setTextColor(
-    COLOR_CYAN);
-
-  canvas.setFont(
-    &fonts::FreeMonoBold24pt7b);
-
-  if (
-    hasSensorData && !isnan(humidity)) {
-    char buffer[16];
-
-    snprintf(
-      buffer,
-      sizeof(buffer),
-      "%.0f",
-      humidity);
-
-    canvas.drawString(
-      buffer,
-      RIGHT_CENTER_X,
-      VALUE_Y);
-  } else {
-    canvas.drawString(
-      "--",
-      RIGHT_CENTER_X,
-      VALUE_Y);
-  }
-
-  // --------------------------------------------------------------------------
-  // Units
-  //
-  // "C" is used for now instead of the degree symbol because the final
-  // JetBrains Mono font subset has not yet been embedded.
-  // --------------------------------------------------------------------------
-
-  canvas.setFont(
-    &fonts::FreeMonoBold12pt7b);
-
-  canvas.setTextColor(
-    COLOR_ORANGE);
-
-  canvas.drawString(
-    "C",
-    LEFT_CENTER_X,
-    UNIT_Y);
-
-  canvas.setTextColor(
-    COLOR_CYAN);
-
-  canvas.drawString(
-    "%",
-    RIGHT_CENTER_X,
-    UNIT_Y);
-}
-
-// ============================================================================
-// Footer
-// ============================================================================
-
-void drawFooter() {
-  static constexpr int DIVIDER_Y = 195;
-  static constexpr int FOOTER_Y = 218;
-
-  // --------------------------------------------------------------------------
-  // Divider
-  // --------------------------------------------------------------------------
-
-  canvas.drawFastHLine(
-    14,
-    DIVIDER_Y,
-    SCREEN_W - 28,
-    COLOR_DIVIDER);
-
-  // --------------------------------------------------------------------------
-  // MQTT indicator
-  // --------------------------------------------------------------------------
-
-  const uint16_t mqttColor =
-    mqttClient.connected()
-      ? COLOR_GREEN
-      : COLOR_RED;
-
-  canvas.fillCircle(
-    18,
-    FOOTER_Y,
-    4,
-    mqttColor);
-
-  canvas.setFont(
-    &fonts::FreeMono9pt7b);
-
-  canvas.setTextDatum(
-    middle_left);
-
-  canvas.setTextColor(
-    COLOR_MUTED);
-
-  canvas.drawString(
-    "MQTT",
-    28,
-    FOOTER_Y);
-
-  // --------------------------------------------------------------------------
-  // Data freshness state
-  // --------------------------------------------------------------------------
-
-  canvas.setFont(
-    &fonts::FreeMonoBold9pt7b);
-
-  canvas.setTextColor(
-    getDataStateColor());
-
-  canvas.drawString(
-    getDataStateString(),
-    83,
-    FOOTER_Y);
-
-  // --------------------------------------------------------------------------
-  // Data age
-  // --------------------------------------------------------------------------
-
-  canvas.setFont(
-    &fonts::FreeMono9pt7b);
-
-  canvas.setTextDatum(
-    middle_right);
-
-  canvas.setTextColor(
-    COLOR_MUTED);
-
-  canvas.drawString(
-    getDataAgeString(),
-    SCREEN_W - 14,
-    FOOTER_Y);
-}
-
-// ============================================================================
-// Date / time formatting
-// ============================================================================
-
-String getTimeString() {
-  struct tm timeInfo;
-
-  if (
-    !getLocalTime(
-      &timeInfo,
-      10)) {
-    return "--:--";
-  }
-
-  char buffer[8];
-
-  snprintf(
-    buffer,
-    sizeof(buffer),
-    "%02d:%02d",
-    timeInfo.tm_hour,
-    timeInfo.tm_min);
-
-  return String(buffer);
-}
-
-String getDateString() {
-  struct tm timeInfo;
-
-  if (
-    !getLocalTime(
-      &timeInfo,
-      10)) {
-    return "--/--";
-  }
-
-  char buffer[8];
-
-  snprintf(
-    buffer,
-    sizeof(buffer),
-    "%02d/%02d",
-    timeInfo.tm_mon + 1,
-    timeInfo.tm_mday);
-
-  return String(buffer);
-}
-
-// ============================================================================
-// Data freshness
-// ============================================================================
-
-String getDataStateString() {
-  if (!hasSensorData) {
-    return "WAIT";
-  }
-
-  if (
-    !isTimeValid() || lastDataReceivedAt == 0) {
-    return "LIVE";
-  }
-
-  const time_t now =
-    time(nullptr);
-
-  if (now < lastDataReceivedAt) {
-    return "LIVE";
-  }
-
-  const uint32_t age =
-    static_cast<uint32_t>(
-      now - lastDataReceivedAt);
-
-  if (age < DATA_STALE_SEC) {
-    return "LIVE";
-  }
-
-  if (age < DATA_OFFLINE_SEC) {
-    return "STALE";
-  }
-
-  return "OFFLINE";
-}
-
-uint16_t getDataStateColor() {
-  const String state =
-    getDataStateString();
-
-  if (state == "LIVE") {
-    return COLOR_GREEN;
-  }
-
-  if (state == "STALE") {
-    return COLOR_YELLOW;
-  }
-
-  if (state == "OFFLINE") {
-    return COLOR_RED;
-  }
-
-  return COLOR_PURPLE;
-}
-
-String getDataAgeString() {
-  if (!hasSensorData) {
-    return "waiting";
-  }
-
-  if (
-    !isTimeValid() || lastDataReceivedAt == 0) {
-    return "received";
-  }
-
-  const time_t now =
-    time(nullptr);
-
-  if (now < lastDataReceivedAt) {
-    return "received";
-  }
-
-  const uint32_t age =
-    static_cast<uint32_t>(
-      now - lastDataReceivedAt);
-
-  if (age < 60) {
-    return String(age) + "s ago";
-  }
-
-  if (age < 3600) {
-    return String(age / 60) + "m ago";
-  }
-
-  if (age < 86400) {
-    return String(age / 3600) + "h ago";
-  }
-
-  return String(age / 86400) + "d ago";
-}
+void drawStatusPage(){const int l=18,r=302;const int ys[]={60,84,108,132,156,180};drawTextSmall("Wi-Fi",l,ys[0],middle_left,COLOR_MUTED);drawTextSmall(WiFi.status()==WL_CONNECTED?String(WiFi.RSSI())+" dBm":"OFFLINE",r,ys[0],middle_right,WiFi.status()==WL_CONNECTED?COLOR_GREEN:COLOR_RED);drawTextSmall("MQTT",l,ys[1],middle_left,COLOR_MUTED);drawTextSmall(mqttClient.connected()?"CONNECTED":"OFFLINE",r,ys[1],middle_right,mqttClient.connected()?COLOR_GREEN:COLOR_RED);drawTextSmall("Sensor",l,ys[2],middle_left,COLOR_MUTED);drawTextSmall("B3D8",r,ys[2],middle_right,COLOR_TEXT);drawTextSmall("Data age",l,ys[3],middle_left,COLOR_MUTED);drawTextSmall(getDataAgeString(),r,ys[3],middle_right,getDataStateColor());drawTextSmall("IP",l,ys[4],middle_left,COLOR_MUTED);drawTextSmall(getIPAddressString(),r,ys[4],middle_right,COLOR_TEXT);drawTextSmall("Uptime",l,ys[5],middle_left,COLOR_MUTED);drawTextSmall(getUptimeString(),r,ys[5],middle_right,COLOR_TEXT);}
+void drawFooter(){canvas.drawFastHLine(14,195,292,COLOR_DIVIDER);canvas.fillCircle(18,218,4,mqttClient.connected()?COLOR_GREEN:COLOR_RED);drawTextSmall("MQTT",28,218,middle_left,COLOR_MUTED);if(currentPage==Page::MAIN){drawTextSmall(getDataStateString(),83,218,middle_left,getDataStateColor());drawTextSmall(getDataAgeString(),306,218,middle_right,COLOR_MUTED);}else drawTextSmall(String("v")+APP_VERSION,306,218,middle_right,COLOR_MUTED);}
+void drawScreen(){if(displaySleeping)return;canvas.fillSprite(COLOR_BG);drawHeader();if(currentPage==Page::MAIN)drawMainPage();else drawStatusPage();drawFooter();canvas.pushSprite(0,0);}
+
+void connectWiFi(){Serial.printf("WiFi: connecting to %s\n",WIFI_SSID);WiFi.mode(WIFI_STA);WiFi.setAutoReconnect(true);WiFi.persistent(false);WiFi.begin(WIFI_SSID,WIFI_PASSWORD);uint32_t s=millis();while(WiFi.status()!=WL_CONNECTED&&millis()-s<15000UL){delay(250);Serial.print('.');}Serial.println();if(WiFi.status()==WL_CONNECTED){Serial.printf("WiFi: connected IP=%s RSSI=%d dBm\n",WiFi.localIP().toString().c_str(),WiFi.RSSI());}else Serial.println("WiFi: initial connection failed");lastWifiAttemptMs=millis();}
+void maintainWiFi(){if(WiFi.status()==WL_CONNECTED)return;uint32_t n=millis();if(n-lastWifiAttemptMs<WIFI_RETRY_INTERVAL_MS)return;lastWifiAttemptMs=n;Serial.println("WiFi: reconnecting...");WiFi.disconnect();WiFi.begin(WIFI_SSID,WIFI_PASSWORD);}
+void setupTime(){if(WiFi.status()!=WL_CONNECTED)return;configTzTime(TZ_INFO,NTP_SERVER_1,NTP_SERVER_2,NTP_SERVER_3);struct tm t;for(int i=0;i<20;i++){if(getLocalTime(&t,250)){ntpReady=true;Serial.println("NTP: synchronized");return;}delay(250);}Serial.println("NTP: synchronization pending");}
+void updateTimeState(){if(!ntpReady&&isTimeValid()){ntpReady=true;Serial.println("NTP: time became valid");}}
+
+void mqttCallback(char*topic,byte*payload,unsigned int length){if(strcmp(topic,MQTT_TOPIC_ENV))return;JsonDocument doc;auto e=deserializeJson(doc,payload,length);if(e){Serial.printf("JSON: %s\n",e.c_str());return;}float t=doc["temperature"].as<float>(),h=doc["humidity"].as<float>();if(t< -50||t>80||h<0||h>100){Serial.println("MQTT: value out of range");return;}temperature=t;humidity=h;hasSensorData=true;if(isTimeValid())lastDataReceivedAt=time(nullptr);Serial.printf("ENV: %.1f C %.1f %%\n",temperature,humidity);if(!displaySleeping)drawScreen();}
+void setupMQTT(){mqttClient.setServer(MQTT_HOST,MQTT_PORT);mqttClient.setCallback(mqttCallback);mqttClient.setBufferSize(512);}
+void maintainMQTT(){if(WiFi.status()!=WL_CONNECTED||mqttClient.connected())return;uint32_t n=millis();if(n-lastMqttAttemptMs<MQTT_RETRY_INTERVAL_MS)return;lastMqttAttemptMs=n;bool ok=strlen(MQTT_USERNAME)?mqttClient.connect(MQTT_CLIENT_ID,MQTT_USERNAME,MQTT_PASSWORD):mqttClient.connect(MQTT_CLIENT_ID);if(!ok){Serial.printf("MQTT: failed state=%d\n",mqttClient.state());return;}Serial.println("MQTT: connected");mqttClient.subscribe(MQTT_TOPIC_ENV,0);}
+void forceNetworkReconnect(){Serial.println("Network: manual reconnect");mqttClient.disconnect();WiFi.disconnect();delay(100);WiFi.begin(WIFI_SSID,WIFI_PASSWORD);lastWifiAttemptMs=lastMqttAttemptMs=0;}
+
+void registerUserActivity(){lastUserActivityMs=millis();}
+void sleepDisplay(){if(displaySleeping)return;displaySleeping=true;M5.Display.setBrightness(0);Serial.println("Display: sleep");}
+void wakeDisplay(){displaySleeping=false;lastUserActivityMs=millis();M5.Display.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);drawScreen();Serial.println("Display: wake");}
+void loadBrightness(){brightnessIndex=preferences.getUChar("brightness",3);if(brightnessIndex>=BRIGHTNESS_LEVEL_COUNT)brightnessIndex=3;}
+void cycleBrightness(){brightnessIndex=(brightnessIndex+1)%BRIGHTNESS_LEVEL_COUNT;M5.Display.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);preferences.putUChar("brightness",brightnessIndex);Serial.printf("Brightness: %u\n",BRIGHTNESS_LEVELS[brightnessIndex]);}
+void buttonAShort(){if(displaySleeping)wakeDisplay();else sleepDisplay();}
+void buttonALong(){if(displaySleeping){wakeDisplay();return;}registerUserActivity();cycleBrightness();drawScreen();}
+void buttonBShort(){if(displaySleeping){wakeDisplay();return;}registerUserActivity();currentPage=currentPage==Page::MAIN?Page::STATUS:Page::MAIN;drawScreen();}
+void buttonBLong(){if(displaySleeping){wakeDisplay();return;}registerUserActivity();}
+void buttonCShort(){if(displaySleeping){wakeDisplay();return;}registerUserActivity();currentPage=Page::MAIN;drawScreen();}
+void buttonCLong(){if(displaySleeping){wakeDisplay();return;}registerUserActivity();forceNetworkReconnect();drawScreen();}
+void processOne(ButtonState&s,bool pressed,uint32_t now,void(*shortFn)(),void(*longFn)()){if(pressed&&!s.previousPressed){s.pressedAt=now;s.longActionDone=false;}if(pressed&&!s.longActionDone&&now-s.pressedAt>=LONG_PRESS_MS){s.longActionDone=true;longFn();}if(!pressed&&s.previousPressed&&!s.longActionDone)shortFn();s.previousPressed=pressed;}
+void processButtons(){uint32_t n=millis();processOne(buttonA,M5.BtnA.isPressed(),n,buttonAShort,buttonALong);processOne(buttonB,M5.BtnB.isPressed(),n,buttonBShort,buttonBLong);processOne(buttonC,M5.BtnC.isPressed(),n,buttonCShort,buttonCLong);}
+
+void setup(){auto cfg=M5.config();M5.begin(cfg);M5.Display.setRotation(1);Serial.begin(115200);delay(100);Serial.printf("\n%s v%s\n",APP_NAME,APP_VERSION);Serial.printf("Font: %s\n",HAVE_JETBRAINS_MONO?"JetBrains Mono embedded":"FreeMono fallback (run tools/install_jetbrains_mono.sh)");preferences.begin("envmonitor",false);loadBrightness();M5.Display.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);Serial.printf("Heap before canvas: free=%u largest=%u\n",ESP.getFreeHeap(),heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));canvas.setColorDepth(8);if(canvas.createSprite(SCREEN_W,SCREEN_H)==nullptr){Serial.println("ERROR: canvas allocation failed");while(true)delay(1000);}canvas.setTextWrap(false);lastUserActivityMs=millis();drawScreen();connectWiFi();setupTime();setupMQTT();maintainMQTT();drawScreen();}
+void loop(){M5.update();processButtons();maintainWiFi();if(WiFi.status()==WL_CONNECTED){updateTimeState();maintainMQTT();if(mqttClient.connected())mqttClient.loop();}uint32_t n=millis();if(!displaySleeping&&n-lastUserActivityMs>=DISPLAY_SLEEP_MS)sleepDisplay();if(!displaySleeping&&n-lastDisplayMs>=DISPLAY_INTERVAL_MS){lastDisplayMs=n;drawScreen();}delay(5);}

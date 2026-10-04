@@ -1,0 +1,34 @@
+alias: "MQTT: SwitchBot B3D8 Environment"
+description: "SwitchBot B3D8 の温度・湿度を MQTT へ配信"
+mode: restart
+triggers:
+  - trigger: state
+    entity_id:
+      - sensor.meter_b3d8_temperature
+      - sensor.meter_b3d8_humidity
+  - trigger: homeassistant
+    event: start
+  - trigger: time_pattern
+    minutes: "/1"
+actions:
+  - delay:
+      seconds: 2
+  - condition: template
+    value_template: >
+      {{
+        states('sensor.meter_b3d8_temperature') not in
+        ['unknown', 'unavailable', 'none', ''] and
+        states('sensor.meter_b3d8_humidity') not in
+        ['unknown', 'unavailable', 'none', '']
+      }}
+  - action: mqtt.publish
+    data:
+      topic: "home/env/switchbot-b3d8/raw"
+      retain: true
+      qos: 0
+      payload: >
+        {
+          "id": "switchbot-b3d8",
+          "temperature": {{ states('sensor.meter_b3d8_temperature') | float }},
+          "humidity": {{ states('sensor.meter_b3d8_humidity') | float }}
+        }
