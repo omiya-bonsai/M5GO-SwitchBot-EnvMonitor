@@ -1,4 +1,5 @@
 #include <M5Unified.h>
+#include <M5_STHS34PF80.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -29,6 +30,8 @@
 namespace App {
 constexpr char NAME[] = "M5GO-SwitchBot-EnvMonitor";
 constexpr char VERSION[] = "0.7.0";
+constexpr uint32_t UNIT_I2C_HZ = 100000;
+constexpr uint32_t TMOS_POLL_MS = 50;
 
 constexpr int SCREEN_WIDTH = 320;
 constexpr int SCREEN_HEIGHT = 240;
@@ -273,6 +276,8 @@ struct Latency {
   }
 };
 Timing stats, graph, draw, push, mqttConnect, mqttLoop, sdlog, nvs, output;
+Timing tmosPoll;
+uint32_t tmosErrors = 0;
 Latency gap, loop;
 uint32_t cacheHit = 0, cacheMiss = 0, cacheRefresh = 0;
 uint32_t graphHit = 0, graphMiss = 0, graphRebuild = 0, graphIncremental = 0;
@@ -307,6 +312,11 @@ void summary() {
     if (row == 1) {
       length = snprintf(text, sizeof(text), "PERF SUMMARY uptime=%lu page=%s cumulative units=us\n",
         (unsigned long)(millis()/1000), pageName(currentPage));
+    } else if (row == 15) {
+      length = snprintf(text, sizeof(text), "tmos_poll_max_us=%lu last_us=%lu calls=%lu\n",
+        (unsigned long)tmosPoll.maximum, (unsigned long)tmosPoll.last, (unsigned long)tmosPoll.calls);
+    } else if (row == 16) {
+      length = snprintf(text, sizeof(text), "tmos_errors=%lu\n", (unsigned long)tmosErrors);
     } else if (row == 14) {
       length = snprintf(text, sizeof(text), "graph_cache hit=%lu miss=%lu rebuild=%lu incremental=%lu dirty=%u valid=%u\n",
         (unsigned long)graphHit, (unsigned long)graphMiss, (unsigned long)graphRebuild,
@@ -338,10 +348,79 @@ void summary() {
   if (room >= static_cast<int>(length - offset)) {
     offset += Serial.write(reinterpret_cast<const uint8_t*>(text + offset), length - offset);
   }
-  if (offset == length) { if (++row > 14) row = 0; }
+  if (offset == length) { if (++row > 16) row = 0; }
   output.add(static_cast<uint32_t>(micros() - begin));
 }
 }  // namespace Perf
+
+// =============================================================================
+// Optional Port A units: share M5Unified's existing bus with the internal IMU.
+// =============================================================================
+
+class EnvTmos : public M5_STHS34PF80 {
+ public:
+  bool beginShared() {
+    initializing = true; failed = false; started = millis();
+    sensor.handle = this; sensor.read_reg = readBus; sensor.write_reg = writeBus; sensor.mdelay = pause;
+    bool ok = init() == 0;
+    if (ok) ok = setPresenceThreshold(200) == 0 && setMotionThreshold(200) == 0 &&
+      setPresenceHysteresis(50) == 0 && setMotionHysteresis(50) == 0 &&
+      setTmosODR(STHS34PF80_TMOS_ODR_AT_8Hz) == 0;
+    initializing = false;
+    return ok && !failed;
+  }
+ private:
+  bool initializing = false, failed = false;
+  uint32_t started = 0;
+  bool expired() { return initializing && static_cast<uint32_t>(millis() - started) >= 500; }
+  static void pause(uint32_t ms) { delay(ms); }  // Official reset, setup only.
+  static int32_t readBus(void* handle, uint8_t reg, uint8_t* data, uint16_t len) {
+    auto& self = *static_cast<EnvTmos*>(handle);
+    memset(data, 0, len);  // Error/expiry also terminates the ST DRDY wait.
+    if (!self.expired() && M5.In_I2C.readRegister(0x5A, reg, data, len, App::UNIT_I2C_HZ)) return 0;
+    memset(data, 0, len);
+    self.failed = true;
+    return -1;
+  }
+  static int32_t writeBus(void* handle, uint8_t reg, const uint8_t* data, uint16_t len) {
+    auto& self = *static_cast<EnvTmos*>(handle);
+    if (!self.expired() && M5.In_I2C.writeRegister(0x5A, reg, data, len, App::UNIT_I2C_HZ)) return 0;
+    self.failed = true;
+    return -1;
+  }
+};
+EnvTmos tmosUnit;
+bool tmosAvailable = false, tmosReadOk = true;
+bool tmosPresence = false, tmosMotion = false;
+uint32_t lastTmosPollMs = 0;
+
+void initializePortAUnits() {
+  // M5GO Port A and internal MPU6886 share GPIO21/22. Never release/reinitialize the bus.
+  if (M5.In_I2C.getSDA() != 21 || M5.In_I2C.getSCL() != 22) {
+    Serial.println("UNITS: unexpected internal bus pins - disabled"); return;
+  }
+  if (M5.In_I2C.scanID(0x5A, App::UNIT_I2C_HZ)) tmosAvailable = tmosUnit.beginShared();
+  Serial.printf("TMOS: %s\n", tmosAvailable ? "ready ODR=8Hz" : "unavailable");
+
+}
+
+void maintainPortAUnits() {
+  uint32_t now = millis();
+  if (tmosAvailable && static_cast<uint32_t>(now - lastTmosPollMs) >= App::TMOS_POLL_MS) {
+    lastTmosPollMs = now;
+    sths34pf80_tmos_drdy_status_t ready{};
+    sths34pf80_tmos_func_status_t status{};
+    bool ok;
+    { Perf::Scope timer(Perf::tmosPoll);
+      ok = tmosUnit.getDataReady(&ready) == 0;
+      if (ok && ready.drdy) ok = tmosUnit.getStatus(&status) == 0;
+    }
+    if (!ok) ++Perf::tmosErrors;
+    if (ok != tmosReadOk) { Serial.printf("TMOS: read %s\n", ok ? "recovered" : "failed"); tmosReadOk = ok; }
+    if (ok && ready.drdy) { tmosPresence = status.pres_flag; tmosMotion = status.mot_flag; }
+  }
+
+}
 
 // =============================================================================
 // Persistent UI state
@@ -2587,6 +2666,7 @@ void setup() {
   initializeImu();
   initializeRgbLeds();
   initializeSdCard();
+  initializePortAUnits();
   configureMQTT();
   configureWiFi();
 
@@ -2607,6 +2687,7 @@ void loop() {
   M5.update();
 
   processButtons(now);
+  maintainPortAUnits();
 
   maintainWiFi(now);
   maintainTime();

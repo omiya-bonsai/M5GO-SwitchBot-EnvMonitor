@@ -32,6 +32,7 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 | A/B/C buttons | IMU 操作と併用可能な物理ボタン |
 | Battery | M5.Power による残量 %、電圧の生値はシステム CSV のみ維持 |
 | Wi-Fi | MQTT と NTP の通信 |
+| TMOS（任意） | Port Aでpresence／motionを取得。Display・照明操作なし |
 
 Charger Base は任意であり、ファームウェア動作の必須要件ではありません。常時運用には適切な電源が必要です。バッテリー持続時間は規定していません。
 
@@ -44,11 +45,12 @@ Charger Base は任意であり、ファームウェア動作の必須要件で�
 | M5GFX | 0.2.32 |
 | PubSubClient | 2.8 |
 | ArduinoJson | 7.4.3 |
+| M5-STHS34PF80 | 0.0.1、TMOS公式センサードライバー |
 | ESP32 同梱 API | WiFi、Preferences、SD、SPI、time、heap 診断、RMT |
 
 外部 RGB LED ライブラリは不要です。
 
-SD 音声追加後の使用量：Flash 1,267,659 / 1,310,720 bytes（96%）、残り43,061 bytes。global RAM 84,580 / 327,680 bytes（25%）、残り243,100 bytes。音声追加前のローカル v0.7.0（Flash 1,239,739、RAM 59,804 bytes）から Flash +27,920、global RAM +24,776 bytesです。今回の音声追加は実機未検証です。
+Gesture撤去後のTMOS単独統合版ローカルビルド：Flash 1,291,039 / 1,310,720 bytes（98%）、残り19,681 bytes。global RAM 86,556 / 327,680 bytes（26%）。Gesture統合版（Flash 1,293,211、RAM 86,596 bytes）からFlash 2,172、RAM 40 bytes削減しました。確認環境はESP32 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、M5-STHS34PF80 0.0.1。撤去後の実機動作は未検証です。
 
 ## 画面とボタン
 
@@ -113,6 +115,18 @@ Display ON 中の C 長押し（800 ms）で、既存の MQTT 接続を使い `h
 音量は `App::LIGHT_TOGGLE_SOUND_VOLUME = 48`（0〜255）。3個の8 KB PCM バッファを順に使い、Speaker の非同期再生が参照するデータを維持します。loop は2スロットのキューに空きがあるときだけ最大1チャンク（8 KB）を読み込み、音声全体の終了を待ちません。SD 読み込み自体は同期処理で、CSV・統計・通信処理が遅いと音切れが起こり得ます。音質・音量は実機確認が必要です。同じ SD インスタンスをメインループの音声読み込みとログ書き込みで共有し、SD 再初期化や CSV 変更はしません。
 
 LED は従来どおり約300 msで終了し、音と独立して環境表示へ戻ります。SD／ファイルなし、WAV 不正、Speaker 初期化／キュー投入失敗は AUDIO 警告を出すだけで、MQTT 成功と LED を妨げません。MQTT 失敗時や Display OFF の Wake では音を開始しません。再生中の再度の有効 C 長押しでは MQTT と LED は通常どおり実行し、音のみスキップして多重再生／再スタートしません。音はコマンド送信のフィードバックであり、実際の照明 ON/OFF や HA 実行確認ではありません。起動音は要求しません。圧縮／float／extensible WAV は拒否し、それらの場合のみ PCM 変換が必要です。指定の標準48 kHz WAV の変換は不要です。
+
+## Port A TMOS（任意）
+
+TMOS PIR UNIT（STHS34PF80、I²C `0x5A`）をPort A（SDA GPIO21／SCL GPIO22）へ接続します。M5Unifiedの既存`In_I2C`を共有し、UNIT通信は100kHz。バスを解放・再初期化せず、内蔵IMUとの通信を維持します。
+
+DRDY確認は50ms周期、ODR8Hz、presence／motion閾値200、hysteresis50です。正常なDRDY付き読み取りで最新presence／motion flagを更新します。現段階ではTMOSからDisplay・照明を操作しません。Gesture依存のpresence hold／Wake処理は撤去しました。
+
+依存ライブラリはM5-STHS34PF80 **0.0.1**です。未接続・初期化失敗はTMOSのみ無効化し、読み取り失敗・復帰を記録します。初期化期限500msはI²C通信の合間で確認します。初期化できなかったUNITを再接続した場合は再起動してください。
+
+PERFは`tmos_poll_max_us`、`last_us`、`calls`、`tmos_errors`と、既存loop／UI／cache計測を維持しています。
+
+Gesture UNITは評価しましたが、false positiveのため本番の照明操作入力として採用しません。[実機評価記録](docs/gesture-unit-evaluation.md)を参照してください。
 
 ## IMU ジェスチャー
 

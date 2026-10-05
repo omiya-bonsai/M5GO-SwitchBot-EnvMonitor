@@ -32,6 +32,7 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 | A/B/C buttons | Physical controls remain available with IMU gestures |
 | Battery | Battery level (%) via M5.Power; raw voltage retained only in system CSV |
 | Wi-Fi | MQTT and NTP connectivity |
+| Optional TMOS | Port A presence/motion sensing; no display or light action |
 
 A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
 
@@ -44,11 +45,12 @@ The following is the supplied target environment. The repository does not pin de
 | M5GFX | 0.2.32 |
 | PubSubClient | 2.8 |
 | ArduinoJson | 7.4.3 |
+| M5-STHS34PF80 | 0.0.1, official TMOS sensor driver |
 | ESP32 bundled APIs | WiFi, Preferences, SD, SPI, time, heap diagnostics, RMT |
 
 No external RGB LED library is required.
 
-Build size with SD audio feedback: Flash 1,267,659 / 1,310,720 bytes (96%), leaving 43,061 bytes; global RAM 84,580 / 327,680 bytes (25%), leaving 243,100 bytes. Compared with the local v0.7.0 build before audio (1,239,739 bytes / 59,804 bytes RAM), Flash increased by 27,920 bytes and global RAM by 24,776 bytes. Device audio behavior has not been tested in this update.
+Local TMOS-only build after Gesture removal: Flash 1,291,039 / 1,310,720 bytes (98%), leaving 19,681 bytes; global RAM 86,556 / 327,680 bytes (26%). Compared with the Gesture-integrated build (1,293,211 Flash / 86,596 RAM), this saves 2,172 Flash bytes and 40 RAM bytes. Built with ESP32 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28 and M5-STHS34PF80 0.0.1. Device validation of this removal is pending.
 
 ## Screens and buttons
 
@@ -113,6 +115,18 @@ After successful light-command publish, `/sounds/light-toggle.wav` is streamed f
 Volume is `App::LIGHT_TOGGLE_SOUND_VOLUME = 48` (0–255). Three 8 KB PCM buffers keep asynchronous Speaker requests alive. The loop reads at most one 8 KB chunk when its two-slot channel queue has room, without waiting for the complete sound. SD reads remain synchronous, and slow CSV/statistics/network work can cause audio gaps; playback quality and volume require device testing. The same SD instance is shared by reads and log writes in the main loop; SD is not reinitialized and CSV schemas remain unchanged.
 
 LED feedback still ends after approximately 300 ms and restores environmental LEDs independently of sound. Missing SD/file, invalid WAV, Speaker initialization or queue failure logs an AUDIO warning and does not undo or prevent MQTT/LED success. MQTT failure and Display OFF wake start no sound. A second valid C-long still sends MQTT and restarts LED feedback; sound already active is skipped rather than layered or restarted. Sound means command publication, not actual light ON/OFF or HA confirmation. No boot sound is requested. Compressed/float/extensible WAV is rejected; PCM conversion is needed only for unsupported formats, not the supplied standard 48 kHz file.
+
+## Optional Port A TMOS unit
+
+TMOS PIR UNIT (STHS34PF80, I²C `0x5A`) shares M5Unified's existing `In_I2C` on Port A (SDA GPIO21 / SCL GPIO22). Unit transactions use 100kHz; the bus is not released or reinitialized, preserving internal IMU communication.
+
+DRDY is checked every50ms, with ODR8Hz, presence/motion thresholds200 and hysteresis50. Successful ready reads update the latest presence/motion flags. TMOS currently has no display or light-control action; the Gesture-dependent presence hold/wake path has been removed.
+
+Install M5-STHS34PF80 **0.0.1**. Missing/failed initialization disables only TMOS; read failures and recovery are logged. Initialization uses a500ms deadline checked between I²C transactions. Restart after reconnecting an uninitialized unit.
+
+PERF retains `tmos_poll_max_us`, `last_us`, `calls` and `tmos_errors`, alongside all existing loop/UI/cache metrics.
+
+Gesture UNIT was evaluated but rejected as a production light-control input because of false positives. See [the device evaluation](docs/gesture-unit-evaluation.md).
 
 ## IMU gestures
 
