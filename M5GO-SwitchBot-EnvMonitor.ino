@@ -221,6 +221,17 @@ struct StatsCache {
 };
 StatsCache statsCache;
 
+// The displayed 24 h snapshot advances in whole 5 min buckets, as before.
+// Keep the in-progress bucket separately until it enters the displayed window.
+struct GraphCache {
+  bool valid = false, dirty = true, attempted = false;
+  bool loading = false, readFailed = false;
+  time_t windowStart = 0, checkedAt = 0;
+  uint32_t checkedMs = 0;
+  GraphPoint pending;
+};
+GraphCache graphCache;
+
 bool displaySleeping = false;
 bool timeConfigured = false;
 bool timeReadyLogged = false;
@@ -264,6 +275,7 @@ struct Latency {
 Timing stats, graph, draw, push, mqttConnect, mqttLoop, sdlog, nvs, output;
 Latency gap, loop;
 uint32_t cacheHit = 0, cacheMiss = 0, cacheRefresh = 0;
+uint32_t graphHit = 0, graphMiss = 0, graphRebuild = 0, graphIncremental = 0;
 uint32_t lastUpdate = 0;
 bool haveUpdate = false, bChanging = false;
 uint32_t* csvFiles = nullptr;
@@ -295,6 +307,10 @@ void summary() {
     if (row == 1) {
       length = snprintf(text, sizeof(text), "PERF SUMMARY uptime=%lu page=%s cumulative units=us\n",
         (unsigned long)(millis()/1000), pageName(currentPage));
+    } else if (row == 14) {
+      length = snprintf(text, sizeof(text), "graph_cache hit=%lu miss=%lu rebuild=%lu incremental=%lu dirty=%u valid=%u\n",
+        (unsigned long)graphHit, (unsigned long)graphMiss, (unsigned long)graphRebuild,
+        (unsigned long)graphIncremental, graphCache.dirty ? 1U : 0U, graphCache.valid ? 1U : 0U);
     } else if (row == 13) {
       length = snprintf(text, sizeof(text), "stats_cache hit=%lu miss=%lu refresh=%lu dirty=%u valid=%u\n",
         (unsigned long)cacheHit, (unsigned long)cacheMiss, (unsigned long)cacheRefresh,
@@ -322,7 +338,7 @@ void summary() {
   if (room >= static_cast<int>(length - offset)) {
     offset += Serial.write(reinterpret_cast<const uint8_t*>(text + offset), length - offset);
   }
-  if (offset == length) { if (++row > 13) row = 0; }
+  if (offset == length) { if (++row > 14) row = 0; }
   output.add(static_cast<uint32_t>(micros() - begin));
 }
 }  // namespace Perf
@@ -1016,6 +1032,8 @@ void writeHeaderIfNeeded(const char* path, const char* header) {
   file.close();
 }
 
+void updateGraphFromLog(time_t timestamp, float temperature, float humidity);
+
 bool appendEnvironmentLog() {
   if (!sdAvailable || !sensorData.valid || !isClockValid()) return false;
 
@@ -1048,6 +1066,7 @@ bool appendEnvironmentLog() {
   file.close();
   if (!saved) return false;
   statsCache.dirty = true;
+  updateGraphFromLog(now, sensorData.temperature, sensorData.humidity);
 
   Serial.printf("SD: logged %s %.1f C %.1f %%\n",
                 timestamp,
@@ -1181,12 +1200,15 @@ void processGraphCsvLine(const char* line, time_t windowStart, time_t windowEnd)
   const size_t bucket =
     offset / App::GRAPH_BUCKET_SECONDS;
 
-  if (bucket >= App::GRAPH_POINT_COUNT) return;
-
-  graphPoints[bucket].valid = true;
-  graphPoints[bucket].timestamp = timestamp;
-  graphPoints[bucket].temperature = temperature;
-  graphPoints[bucket].humidity = humidity;
+  // The exact window-end sample was previously excluded from the 288 points.
+  // Retain it for the next window without changing the displayed buckets.
+  if (bucket > App::GRAPH_POINT_COUNT) return;
+  GraphPoint& point = bucket == App::GRAPH_POINT_COUNT
+    ? graphCache.pending : graphPoints[bucket];
+  point.valid = true;
+  point.timestamp = timestamp;
+  point.temperature = temperature;
+  point.humidity = humidity;
 }
 
 template<typename LineHandler>
@@ -1196,6 +1218,7 @@ void readCsvFileLines(const char* path, LineHandler handler) {
   File file = SD.open(path, FILE_READ);
   if (!file) {
     Serial.printf("SD: cannot open %s\n", path);
+    if (graphCache.loading) graphCache.readFailed = true;
     return;
   }
 
@@ -1251,33 +1274,109 @@ void loadEnvironmentFilesForRange(time_t rangeStart,
   }
 }
 
+void invalidateGraphCache() {
+  graphCache.valid = false;
+  graphCache.dirty = true;
+  graphCache.attempted = false;
+}
+
+// No SD I/O. Compare wall-clock movement with monotonic elapsed time, then
+// advance by complete buckets. Epoch seconds work across local midnight.
+bool advanceGraphWindow(time_t now) {
+  if (!graphCache.valid) return false;
+  const uint32_t ms = millis();
+  const int64_t wallSeconds = static_cast<int64_t>(now) - graphCache.checkedAt;
+  const uint32_t elapsedSeconds = static_cast<uint32_t>(ms - graphCache.checkedMs) / 1000UL;
+  const int64_t clockError = wallSeconds - elapsedSeconds;
+  if (wallSeconds < 0 || wallSeconds >= 86400 || clockError < -2 || clockError > 2) {
+    invalidateGraphCache();
+    return false;
+  }
+  graphCache.checkedAt = now;
+  graphCache.checkedMs = ms;
+  const time_t end = graphCache.windowStart + 86400;
+  if (now < end) { invalidateGraphCache(); return false; }
+  const size_t steps = static_cast<size_t>((now - end) / App::GRAPH_BUCKET_SECONDS);
+  if (!steps) return false;
+  if (steps >= App::GRAPH_POINT_COUNT) { invalidateGraphCache(); return false; }
+  graphCache.windowStart += steps * App::GRAPH_BUCKET_SECONDS;
+  for (size_t i = 0; i < App::GRAPH_POINT_COUNT; ++i) {
+    graphPoints[i] = i + steps < App::GRAPH_POINT_COUNT
+      ? graphPoints[i + steps] : GraphPoint{};
+  }
+  if (graphCache.pending.valid) {
+    const time_t offset = graphCache.pending.timestamp - graphCache.windowStart;
+    if (offset >= 0 && offset < 86400) {
+      graphPoints[static_cast<size_t>(offset / App::GRAPH_BUCKET_SECONDS)] = graphCache.pending;
+    }
+  }
+  graphCache.pending = GraphPoint{};
+  return true;
+}
+
+// Called only after the persistent CSV has been written and closed successfully.
+void updateGraphFromLog(time_t timestamp, float temperature, float humidity) {
+  if (!graphCache.valid) return;
+  advanceGraphWindow(timestamp);
+  if (!graphCache.valid || timestamp < graphCache.windowStart) return;
+  const size_t bucket = static_cast<size_t>((timestamp - graphCache.windowStart) / App::GRAPH_BUCKET_SECONDS);
+  if (bucket > App::GRAPH_POINT_COUNT) { invalidateGraphCache(); return; }
+  GraphPoint& point = bucket == App::GRAPH_POINT_COUNT
+    ? graphCache.pending : graphPoints[bucket];
+  // Match the CSV's one-decimal representation, including printf rounding.
+  char values[32];
+  snprintf(values, sizeof(values), "%.1f,%.1f", temperature, humidity);
+  if (sscanf(values, "%f,%f", &temperature, &humidity) != 2) {
+    invalidateGraphCache(); return;
+  }
+  point.valid = true;
+  point.timestamp = timestamp;
+  point.temperature = temperature;
+  point.humidity = humidity;
+  ++Perf::graphIncremental;
+}
+
 void loadGraphData() {
   Perf::Scope timer(Perf::graph);
   Perf::graphFiles = Perf::graphLines = 0;
   if (!sdAvailable || !isClockValid()) return;
 
+  ++Perf::graphMiss;
+  graphCache.attempted = true;
+  lastGraphReloadMs = millis();  // Also bounds retries after an SD open failure.
+  graphCache.loading = true;
+  graphCache.readFailed = false;
   clearGraphPoints();
-
+  graphCache.pending = GraphPoint{};
   const time_t windowEnd = time(nullptr);
-  const time_t windowStart = windowEnd - (24UL * 60UL * 60UL);
+  graphCache.windowStart = windowEnd - 86400;
 
   Perf::csvFiles = &Perf::graphFiles; Perf::csvLines = &Perf::graphLines;
-  loadEnvironmentFilesForRange(windowStart, windowEnd, loadGraphFile);
+  loadEnvironmentFilesForRange(graphCache.windowStart, windowEnd, loadGraphFile);
   Perf::csvFiles = Perf::csvLines = nullptr;
-
-  lastGraphReloadMs = millis();
-  Serial.println("GRAPH: 24h data loaded");
+  graphCache.loading = false;
+  graphCache.valid = !graphCache.readFailed;
+  graphCache.dirty = !graphCache.valid;
+  graphCache.checkedAt = windowEnd;
+  graphCache.checkedMs = lastGraphReloadMs;
+  if (graphCache.valid) ++Perf::graphRebuild;
+  Serial.println(graphCache.valid ? "GRAPH: 24h data loaded" : "GRAPH: rebuild failed");
 }
 
-void reloadGraphIfNeeded() {
-  if (currentPage != Page::TemperatureGraph && currentPage != Page::HumidityGraph) {
-    return;
-  }
+void drawScreen();
 
-  const uint32_t now = millis();
-
-  if (lastGraphReloadMs == 0 || intervalElapsed(now, lastGraphReloadMs, App::GRAPH_RELOAD_INTERVAL_MS)) {
+// Only this loop service can start a full rebuild; render/callbacks never do.
+void maintainGraphCache() {
+  const bool graphPage = currentPage == Page::TemperatureGraph || currentPage == Page::HumidityGraph;
+  if (!isClockValid()) { if (graphCache.valid) invalidateGraphCache(); return; }
+  const bool moved = advanceGraphWindow(time(nullptr));
+  if (displaySleeping || !graphPage) return;
+  if (!graphCache.valid && sdAvailable &&
+      (!graphCache.attempted || intervalElapsed(millis(), lastGraphReloadMs, App::GRAPH_RELOAD_INTERVAL_MS))) {
     loadGraphData();
+    drawScreen();
+  } else if (moved) {
+    drawScreen();
   }
 }
 
@@ -1407,13 +1506,11 @@ void performTiltAction(TiltDirection direction,
 
   if (direction == TiltDirection::Left) {
     setCurrentPage(Page::TemperatureGraph);
-    loadGraphData();
     Serial.printf(
       "IMU: tilt ax=%.2f ay=%.2f az=%.2f -> LEFT -> TEMP / 24H\n",
       ax, ay, az);
   } else {
     setCurrentPage(Page::HumidityGraph);
-    loadGraphData();
     Serial.printf(
       "IMU: tilt ax=%.2f ay=%.2f az=%.2f -> RIGHT -> HUM / 24H\n",
       ax, ay, az);
@@ -1524,6 +1621,7 @@ void findGraphRange(bool temperature,
   minimum = 100000.0f;
   maximum = -100000.0f;
   hasData = false;
+  if (!graphCache.valid) return;
 
   for (size_t i = 0; i < App::GRAPH_POINT_COUNT; ++i) {
     if (!graphPoints[i].valid) continue;
@@ -1548,6 +1646,7 @@ void findGraphRange(bool temperature,
 }
 
 void drawGraph(bool temperature) {
+  if (graphCache.valid) ++Perf::graphHit;
   constexpr int LEFT = 42;
   constexpr int RIGHT = 306;
   constexpr int TOP = 58;
@@ -1859,8 +1958,6 @@ void drawFooter() {
 void drawScreen() {
   Perf::Scope timer(Perf::draw);
   if (displaySleeping) return;
-
-  reloadGraphIfNeeded();
 
   canvas.fillSprite(Color::BG);
   drawHeader();
@@ -2260,7 +2357,6 @@ void handleButtonBShort() {
 
     case Page::Status:
       setCurrentPage(Page::TemperatureGraph);
-      loadGraphData();
       break;
 
     case Page::TemperatureGraph:
@@ -2494,8 +2590,8 @@ void setup() {
   configureMQTT();
   configureWiFi();
 
-  // Graph loading is guarded by SD/clock validity; retry on later redraws
-  // once NTP provides a valid clock. Statistics are refreshed separately by maintainStatsCache().
+  // History caches are prepared by loop services once SD/clock are ready;
+  // drawing itself never starts a CSV scan.
   drawScreen();
   lastUserActivityMs = millis();
   lastDisplayRefreshMs = millis();
@@ -2522,6 +2618,7 @@ void loop() {
   maintainDisplaySleep(millis());
   maintainImu(now);
 
+  maintainGraphCache();
   maintainStatsCache();
   refreshDisplayIfDue(millis());
   logHealthIfDue(now);
