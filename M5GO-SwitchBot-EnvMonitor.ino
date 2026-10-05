@@ -27,11 +27,18 @@
 // Application
 // =============================================================================
 
+#define TMOS_DIAGNOSTICS 0  // 0: normal operation, 1: detailed TMOS state diagnostics
+
 namespace App {
 constexpr char NAME[] = "M5GO-SwitchBot-EnvMonitor";
 constexpr char VERSION[] = "0.7.0";
 constexpr uint32_t UNIT_I2C_HZ = 100000;
 constexpr uint32_t TMOS_POLL_MS = 50;
+constexpr uint32_t DLIGHT_POLL_MS = 1000, DLIGHT_STALE_MS = 3000;
+constexpr uint32_t TMOS_STALE_MS = 2000, PRESENCE_HOLD_MS = 10000;
+constexpr float DLIGHT_DARK_LUX = 50, DLIGHT_NORMAL_LUX = 300, DLIGHT_BRIGHT_LUX = 1000;
+constexpr char MQTT_TOPIC_CONTEXT[] = "home/env/study/context";
+constexpr uint32_t CONTEXT_HEARTBEAT_MS = 60000, CONTEXT_PUBLISH_MIN_MS = 1000;
 
 constexpr int SCREEN_WIDTH = 320;
 constexpr int SCREEN_HEIGHT = 240;
@@ -276,8 +283,8 @@ struct Latency {
   }
 };
 Timing stats, graph, draw, push, mqttConnect, mqttLoop, sdlog, nvs, output;
-Timing tmosPoll;
-uint32_t tmosErrors = 0;
+Timing tmosPoll, dlightPoll;
+uint32_t tmosErrors = 0, dlightErrors = 0;
 Latency gap, loop;
 uint32_t cacheHit = 0, cacheMiss = 0, cacheRefresh = 0;
 uint32_t graphHit = 0, graphMiss = 0, graphRebuild = 0, graphIncremental = 0;
@@ -315,6 +322,10 @@ void summary() {
     } else if (row == 15) {
       length = snprintf(text, sizeof(text), "tmos_poll_max_us=%lu last_us=%lu calls=%lu\n",
         (unsigned long)tmosPoll.maximum, (unsigned long)tmosPoll.last, (unsigned long)tmosPoll.calls);
+    } else if (row == 17) {
+      length = snprintf(text, sizeof(text), "dlight_poll_max_us=%lu last_us=%lu dlight_calls=%lu dlight_errors=%lu\n",
+        (unsigned long)dlightPoll.maximum, (unsigned long)dlightPoll.last,
+        (unsigned long)dlightPoll.calls, (unsigned long)dlightErrors);
     } else if (row == 16) {
       length = snprintf(text, sizeof(text), "tmos_errors=%lu\n", (unsigned long)tmosErrors);
     } else if (row == 14) {
@@ -348,7 +359,7 @@ void summary() {
   if (room >= static_cast<int>(length - offset)) {
     offset += Serial.write(reinterpret_cast<const uint8_t*>(text + offset), length - offset);
   }
-  if (offset == length) { if (++row > 16) row = 0; }
+  if (offset == length) { if (++row > 17) row = 0; }
   output.add(static_cast<uint32_t>(micros() - begin));
 }
 }  // namespace Perf
@@ -394,6 +405,131 @@ bool tmosAvailable = false, tmosReadOk = true;
 bool tmosPresence = false, tmosMotion = false;
 uint32_t lastTmosPollMs = 0;
 
+// DLight protocol: M5Stack M5-DLight powerOn/setMode/getLUX, adapted to shared I2C.
+// https://github.com/m5stack/M5-DLight (BH1750FVI, continuous high resolution).
+bool dlightAvailable = false, dlightReadOk = true, haveLux = false;
+float dlightLux = 0;
+uint32_t lastDlightPollMs = 0, lastLuxMs = 0;
+bool haveTmosSample = false, havePresence = false;
+uint32_t lastTmosSampleMs = 0, lastPresenceMs = 0;
+uint8_t lastContextSignature = 255, publishedContextSignature = 255;
+bool contextPublished = false, contextAttempted = false;
+uint32_t lastContextPublishMs = 0, lastContextAttemptMs = 0;
+
+bool dlightCommand(uint8_t command) {
+  const bool started = M5.In_I2C.start(0x23, false, App::UNIT_I2C_HZ);
+  const bool written = started && M5.In_I2C.write(command);
+  const bool stopped = M5.In_I2C.stop();
+  return written && stopped;
+}
+bool dlightRead(float& lux) {
+  uint8_t bytes[2]{};
+  const bool started = M5.In_I2C.start(0x23, true, App::UNIT_I2C_HZ);
+  const bool read = started && M5.In_I2C.read(bytes, 2, true);
+  const bool stopped = M5.In_I2C.stop();
+  if (!read || !stopped) return false;
+  lux = ((uint16_t(bytes[0]) << 8) | bytes[1]) / 1.2f;
+  return true;
+}
+bool luxValid(uint32_t now) {
+  return haveLux && dlightReadOk && uint32_t(now - lastLuxMs) < App::DLIGHT_STALE_MS;
+}
+bool occupancyValid(uint32_t now) {
+  return haveTmosSample && tmosReadOk && uint32_t(now - lastTmosSampleMs) < App::TMOS_STALE_MS;
+}
+bool occupied(uint32_t now) {
+  return havePresence && uint32_t(now - lastPresenceMs) < App::PRESENCE_HOLD_MS;
+}
+uint8_t lightClass(float lux) {
+  return lux < App::DLIGHT_DARK_LUX ? 0 : lux < App::DLIGHT_NORMAL_LUX ? 1 :
+         lux < App::DLIGHT_BRIGHT_LUX ? 2 : 3;
+}
+const char* lightName(uint8_t state) {
+  const char* names[] = {"DARK", "DIM", "NORMAL", "BRIGHT"};
+  return names[state];
+}
+const char* studyContext(uint32_t now) {
+  if (!luxValid(now) || !occupancyValid(now)) return "UNKNOWN";
+  if (occupied(now)) return lightClass(dlightLux) == 0 ? "OCCUPIED_DARK" : "OCCUPIED_LIGHT";
+  return lightClass(dlightLux) == 0 ? "VACANT_DARK" : "VACANT_LIGHT";
+}
+uint8_t contextSignature(uint32_t now) {
+  return (luxValid(now) ? 1 + lightClass(dlightLux) : 0) |
+    (occupancyValid(now) ? 8 : 0) | (occupied(now) ? 16 : 0) |
+    (occupancyValid(now) && tmosMotion ? 32 : 0);
+}
+#if TMOS_DIAGNOSTICS
+// Diagnostic snapshot only: flags are exactly those used by the hold logic,
+// not the sensor's signed presence/motion amplitude registers. No extra I2C.
+void logTmosState() {
+  static uint32_t lastLogMs = 0;
+  static char text[192];
+  static size_t length = 0, offset = 0;
+  const uint32_t now = millis();
+  if (offset == length && uint32_t(now - lastLogMs) >= 1000) {
+    lastLogMs = now;
+    char positiveAge[12], sampleAge[12];
+    if (havePresence) snprintf(positiveAge, sizeof(positiveAge), "%lu", (unsigned long)uint32_t(now - lastPresenceMs));
+    else snprintf(positiveAge, sizeof(positiveAge), "none");
+    if (haveTmosSample) snprintf(sampleAge, sizeof(sampleAge), "%lu", (unsigned long)uint32_t(now - lastTmosSampleMs));
+    else snprintf(sampleAge, sizeof(sampleAge), "none");
+    length = snprintf(text, sizeof(text),
+      "TMOS STATE: pres_flag=%u mot_flag=%u occupied=%u age_positive_ms=%s sample_age_ms=%s valid=%u context=%s\n",
+      unsigned(tmosPresence), unsigned(tmosMotion), unsigned(occupied(now)), positiveAge, sampleAge,
+      unsigned(occupancyValid(now)), studyContext(now));
+    if (length >= sizeof(text)) length = sizeof(text) - 1;
+    offset = 0;
+  }
+  const int room = Serial.availableForWrite();
+  if (offset < length && room > 0) {
+    const size_t remaining = length - offset;
+    const size_t bytes = remaining < size_t(room) ? remaining : size_t(room);
+    offset += Serial.write(reinterpret_cast<const uint8_t*>(text + offset), bytes);
+  }
+}
+
+#endif  // TMOS_DIAGNOSTICS
+
+void maintainStudyContext() {
+  uint32_t now = millis();
+  if (dlightAvailable && uint32_t(now - lastDlightPollMs) >= App::DLIGHT_POLL_MS) {
+    lastDlightPollMs = now;
+    float lux = 0; bool ok;
+    { Perf::Scope timer(Perf::dlightPoll); ok = dlightRead(lux); }
+    if (!ok) ++Perf::dlightErrors;
+    if (ok != dlightReadOk) Serial.printf("DLIGHT: read %s\n", ok ? "recovered" : "failed");
+    dlightReadOk = ok;
+    if (ok) {
+      dlightLux = lux; haveLux = true; lastLuxMs = millis();
+      Serial.printf("DLIGHT: lux=%.1f state=%s\n", lux, lightName(lightClass(lux)));
+    }
+  }
+  now = millis();  // Use a fresh timestamp after I2C/Serial; avoid unsigned future-age underflow.
+  const uint8_t signature = contextSignature(now);
+  if (signature != lastContextSignature) {
+    lastContextSignature = signature;
+    Serial.printf("CONTEXT: %s\n", studyContext(now));
+  }
+  // Reconnection forces a fresh snapshot; no offline queue or reconnect here.
+  if (!mqttClient.connected()) { contextPublished = false; return; }
+  if (contextAttempted && uint32_t(now - lastContextAttemptMs) < App::CONTEXT_PUBLISH_MIN_MS) return;
+  if (contextPublished && signature == publishedContextSignature &&
+      uint32_t(now - lastContextPublishMs) < App::CONTEXT_HEARTBEAT_MS) return;
+  contextAttempted = true; lastContextAttemptMs = now;
+  char lux[20], payload[192];
+  if (luxValid(now)) snprintf(lux, sizeof(lux), "%.1f", dlightLux);
+  else snprintf(lux, sizeof(lux), "null");
+  const bool validPresence = occupancyValid(now);
+  snprintf(payload, sizeof(payload),
+    "{\"lux\":%s,\"light_state\":\"%s\",\"occupied\":%s,\"motion\":%s,\"context\":\"%s\"}",
+    lux, luxValid(now) ? lightName(lightClass(dlightLux)) : "UNKNOWN",
+    validPresence ? (occupied(now) ? "true" : "false") : "null",
+    validPresence ? (tmosMotion ? "true" : "false") : "null", studyContext(now));
+  if (mqttClient.publish(App::MQTT_TOPIC_CONTEXT, payload, false)) {
+    publishedContextSignature = signature; contextPublished = true; lastContextPublishMs = now;
+  }
+}
+
 void initializePortAUnits() {
   // M5GO Port A and internal MPU6886 share GPIO21/22. Never release/reinitialize the bus.
   if (M5.In_I2C.getSDA() != 21 || M5.In_I2C.getSCL() != 22) {
@@ -401,6 +537,11 @@ void initializePortAUnits() {
   }
   if (M5.In_I2C.scanID(0x5A, App::UNIT_I2C_HZ)) tmosAvailable = tmosUnit.beginShared();
   Serial.printf("TMOS: %s\n", tmosAvailable ? "ready ODR=8Hz" : "unavailable");
+  if (M5.In_I2C.scanID(0x23, App::UNIT_I2C_HZ)) {
+    dlightAvailable = dlightCommand(0x01) && dlightCommand(0x10);
+  }
+  lastDlightPollMs = millis();  // First read after 1s; no conversion wait in loop.
+  Serial.printf("DLIGHT: %s\n", dlightAvailable ? "ready 0x23" : "unavailable");
 
 }
 
@@ -415,9 +556,13 @@ void maintainPortAUnits() {
       ok = tmosUnit.getDataReady(&ready) == 0;
       if (ok && ready.drdy) ok = tmosUnit.getStatus(&status) == 0;
     }
-    if (!ok) ++Perf::tmosErrors;
+    if (!ok) { ++Perf::tmosErrors; haveTmosSample = false; }
     if (ok != tmosReadOk) { Serial.printf("TMOS: read %s\n", ok ? "recovered" : "failed"); tmosReadOk = ok; }
-    if (ok && ready.drdy) { tmosPresence = status.pres_flag; tmosMotion = status.mot_flag; }
+    if (ok && ready.drdy) {
+      tmosPresence = status.pres_flag; tmosMotion = status.mot_flag;
+      haveTmosSample = true; lastTmosSampleMs = millis();
+      if (tmosPresence) { havePresence = true; lastPresenceMs = lastTmosSampleMs; }
+    }
   }
 
 }
@@ -1952,6 +2097,13 @@ void drawMainPage() {
   canvas.drawCircle(LEFT_CENTER_X - 11, 158, 3, Color::ORANGE);
   drawMedium("C", LEFT_CENTER_X + 4, 171, middle_center, Color::ORANGE);
   drawMedium("%", RIGHT_CENTER_X, 171, middle_center, Color::CYAN);
+  const uint32_t contextNow = millis();
+  char contextLine[40];
+  if (luxValid(contextNow)) snprintf(contextLine, sizeof(contextLine), "%.0f lx", dlightLux);
+  else snprintf(contextLine, sizeof(contextLine), "LUX --");
+  drawSmall(contextLine, 18, 195, middle_left, Color::MUTED);
+  drawSmall(occupancyValid(contextNow) ? (occupied(contextNow) ? "OCCUPIED" : "VACANT") : "PRESENCE --",
+            302, 195, middle_right, Color::MUTED);
 }
 
 void drawStatusPage() {
@@ -2692,6 +2844,7 @@ void loop() {
   maintainWiFi(now);
   maintainTime();
   maintainMQTT(now);
+  maintainStudyContext();
   maintainSdLogging(now);
   maintainLightFeedback(millis());
   maintainLightSound();
@@ -2707,4 +2860,7 @@ void loop() {
   delay(2);
   Perf::loop.add(static_cast<uint32_t>(micros()-perfLoopStart));
   Perf::summary();  // Excluded from loop time, included in the real update gap.
+#if TMOS_DIAGNOSTICS
+  logTmosState();  // At most 1Hz; UART-room-limited output, no sensor/control changes.
+#endif
 }

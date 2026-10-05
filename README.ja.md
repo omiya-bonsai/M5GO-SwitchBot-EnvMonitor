@@ -32,7 +32,7 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 | A/B/C buttons | IMU 操作と併用可能な物理ボタン |
 | Battery | M5.Power による残量 %、電圧の生値はシステム CSV のみ維持 |
 | Wi-Fi | MQTT と NTP の通信 |
-| TMOS（任意） | Port Aでpresence／motionを取得。Display・照明操作なし |
+| TMOS／DLight（任意） | Port Aでpresence／motion・照度を観測。照明自動操作なし |
 
 Charger Base は任意であり、ファームウェア動作の必須要件ではありません。常時運用には適切な電源が必要です。バッテリー持続時間は規定していません。
 
@@ -50,7 +50,7 @@ Charger Base は任意であり、ファームウェア動作の必須要件で�
 
 外部 RGB LED ライブラリは不要です。
 
-Gesture撤去後のTMOS単独統合版ローカルビルド：Flash 1,291,039 / 1,310,720 bytes（98%）、残り19,681 bytes。global RAM 86,556 / 327,680 bytes（26%）。Gesture統合版（Flash 1,293,211、RAM 86,596 bytes）からFlash 2,172、RAM 40 bytes削減しました。確認環境はESP32 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、M5-STHS34PF80 0.0.1。撤去後の実機動作は未検証です。
+書斎context版ローカルビルド：Flash 1,293,263 / 1,310,720 bytes（98%）、残り17,457 bytes。global RAM 86,612 / 327,680 bytes（26%）。TMOS単独版（Flash 1,291,039、RAM 86,556 bytes）からFlash +2,224、RAM +56 bytesです。確認環境はESP32 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、M5-STHS34PF80 0.0.1。contextの実機動作はユーザー確認済みです（10秒hold満了・再入室による遷移、motionでholdを延長しないこと）。
 
 ## 画面とボタン
 
@@ -120,13 +120,50 @@ LED は従来どおり約300 msで終了し、音と独立して環境表示へ�
 
 TMOS PIR UNIT（STHS34PF80、I²C `0x5A`）をPort A（SDA GPIO21／SCL GPIO22）へ接続します。M5Unifiedの既存`In_I2C`を共有し、UNIT通信は100kHz。バスを解放・再初期化せず、内蔵IMUとの通信を維持します。
 
-DRDY確認は50ms周期、ODR8Hz、presence／motion閾値200、hysteresis50です。正常なDRDY付き読み取りで最新presence／motion flagを更新します。現段階ではTMOSからDisplay・照明を操作しません。Gesture依存のpresence hold／Wake処理は撤去しました。
+DRDY確認は50ms周期、ODR8Hz、presence／motion閾値200、hysteresis50です。正常なDRDY付き読み取りでpresence／motion flagを更新し、下記contextに使用します。TMOSからDisplay・照明を操作しません。Gesture依存のWake処理は撤去したままです。
 
 依存ライブラリはM5-STHS34PF80 **0.0.1**です。未接続・初期化失敗はTMOSのみ無効化し、読み取り失敗・復帰を記録します。初期化期限500msはI²C通信の合間で確認します。初期化できなかったUNITを再接続した場合は再起動してください。
 
 PERFは`tmos_poll_max_us`、`last_us`、`calls`、`tmos_errors`と、既存loop／UI／cache計測を維持しています。
 
+スケッチ冒頭の`TMOS_DIAGNOSTICS`を`1`にして再ビルドすると、約1秒周期の`TMOS STATE:` flag／hold／freshness診断を有効にできます。既定値`0`では詳細診断コード・バッファをコンパイル対象から除外し、通常PERFとセンサー／context処理は維持します。
+
 Gesture UNITは評価しましたが、false positiveのため本番の照明操作入力として採用しません。[実機評価記録](docs/gesture-unit-evaluation.md)を参照してください。
+
+## 書斎環境コンテキスト（TMOS + DLight）
+
+TMOS（`0x5A`）とDLight／BH1750FVI（`0x23`）をY字GROVEでPort Aへ接続します。SDA GPIO21／SCL GPIO22を共有し、UNIT通信は100kHz。内蔵IMUバスを再初期化しません。DLightはM5Unifiedの`In_I2C.start/write/read/stop`で、[公式M5-DLightのコマンド・lux換算](https://github.com/m5stack/M5-DLight/blob/master/src/M5_DLight.cpp)に従って通信します。DLightライブラリの追加は不要です。導入済みM5-DLight0.0.3は調査しましたがリンクしません。同版の`getLUX()`は生カウントを返し、今回採用した現行公式のraw／1.2換算とは異なります。
+
+| 入力 | 役割・周期 |
+| --- | --- |
+| TMOS | presence／motion観測。既存50ms DRDY確認、ODR8Hz |
+| DLight | 照度観測。連続高分解能モード（`0x10`）、1秒周期読み取り。16-bit big-endian生値／1.2 |
+| 物理C長押し | 明示的な照明toggle。既存MQTT・LED・効果音を維持 |
+
+**TMOS／DLightは照明の自動操作やDisplayのWake／sleepを行いません。** KEY UNITは今回未実装で、明示的な操作入力として別途検討します。Gestureは撤去したままです。
+
+| lux | 照度分類 |
+| --- | --- |
+| `<50` | DARK |
+| `50〜<300` | DIM |
+| `300〜<1000` | NORMAL |
+| `>=1000` | BRIGHT |
+
+閾値は`App::DLIGHT_DARK_LUX`、`DLIGHT_NORMAL_LUX`、`DLIGHT_BRIGHT_LUX`で調整できます。照度分類のhysteresisはまだありません。occupancyは最後の正常なpresence=1から10秒保持し、単発の負sampleですぐ解除しません。motionは別に扱い、holdを延長しません。TMOSは2秒、DLightは3秒で取得値を期限切れとし、読み取りエラー時は即時無効にして次の正常なDRDY付きsample／読み取りで復帰します。未接続を暗い／不在と推定せずUNKNOWNとします。初期化は起動時のみなので、未接続UNITを再接続した場合は再起動してください。
+
+有効な観測では`VACANT_DARK`、`VACANT_LIGHT`、`OCCUPIED_DARK`、`OCCUPIED_LIGHT`を生成します。DIM／NORMAL／BRIGHTはLIGHT扱いです。どちらかのセンサーが無効ならcontextは`UNKNOWN`です。これは観測結果であり、人の在室を保証する判定ではありません。
+
+MAINの内容領域下部へ照度・hold後の在室状態を追加しました。無効時は`LUX --`／`PRESENCE --`。既存6ページと描画周期を維持します。
+
+MQTTは`home/env/study/context`へnon-retained・QoS0でpublishします。分類／在室／motion／validity変化時、再接続後、または60秒heartbeatで送信し、試行は最短1秒間隔です。短時間の変化は最新状態へまとめられ、同じ照度分類内のlux変化はheartbeatで通知します。offline queueは追加しません。接続中の既存PubSubClient publishは同期処理なので、障害時の時間は実機PERFで確認してください。
+
+```json
+{"lux":327.4,"light_state":"NORMAL","occupied":true,"motion":false,"context":"OCCUPIED_LIGHT"}
+```
+
+無効なluxは`null`と`light_state:"UNKNOWN"`、無効なpresence／motionは`null`、複合contextは`UNKNOWN`です。MQTT失敗でも観測値や照明操作権限は変化しません。Serialは正常な照度値を1秒ごと（`DLIGHT: lux=327.4 state=NORMAL`）、context遷移とread failure／recoveryを出力します。PERFへ`dlight_poll_max_us`、`last_us`、`dlight_calls`、`dlight_errors`を追加しました。I²C readのみを測り、Serial／MQTT／LCD時間は含めません。変換待ちはセンサー内部で行い、loopで待ちません。I²C通信そのものは既存ドライバーのtimeoutに従う同期処理です。
+
+context SDログとDLightグラフは追加していません。既存温湿度・システムCSVのschema、Graph／STATS cache、ボタン、NVS、IMU、180秒auto-offを維持しています。
 
 ## IMU ジェスチャー
 

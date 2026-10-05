@@ -32,7 +32,7 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 | A/B/C buttons | Physical controls remain available with IMU gestures |
 | Battery | Battery level (%) via M5.Power; raw voltage retained only in system CSV |
 | Wi-Fi | MQTT and NTP connectivity |
-| Optional TMOS | Port A presence/motion sensing; no display or light action |
+| Optional TMOS / DLight | Port A presence/motion and illuminance observations; no automatic light control |
 
 A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
 
@@ -50,7 +50,7 @@ The following is the supplied target environment. The repository does not pin de
 
 No external RGB LED library is required.
 
-Local TMOS-only build after Gesture removal: Flash 1,291,039 / 1,310,720 bytes (98%), leaving 19,681 bytes; global RAM 86,556 / 327,680 bytes (26%). Compared with the Gesture-integrated build (1,293,211 Flash / 86,596 RAM), this saves 2,172 Flash bytes and 40 RAM bytes. Built with ESP32 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28 and M5-STHS34PF80 0.0.1. Device validation of this removal is pending.
+Local study-context build: Flash 1,293,263 / 1,310,720 bytes (98%), leaving 17,457 bytes; global RAM 86,612 / 327,680 bytes (26%). Relative to the TMOS-only baseline (1,291,039 Flash / 86,556 RAM), this adds 2,224 Flash bytes and 56 RAM bytes. Built with ESP32 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28 and M5-STHS34PF80 0.0.1. The user has verified device context transitions, including10s presence hold expiry/re-entry and motion not extending the hold.
 
 ## Screens and buttons
 
@@ -120,13 +120,50 @@ LED feedback still ends after approximately 300 ms and restores environmental LE
 
 TMOS PIR UNIT (STHS34PF80, I²C `0x5A`) shares M5Unified's existing `In_I2C` on Port A (SDA GPIO21 / SCL GPIO22). Unit transactions use 100kHz; the bus is not released or reinitialized, preserving internal IMU communication.
 
-DRDY is checked every50ms, with ODR8Hz, presence/motion thresholds200 and hysteresis50. Successful ready reads update the latest presence/motion flags. TMOS currently has no display or light-control action; the Gesture-dependent presence hold/wake path has been removed.
+DRDY is checked every50ms, with ODR8Hz, presence/motion thresholds200 and hysteresis50. Successful ready reads update presence/motion flags for the study context below. TMOS has no display or light-control action; the Gesture-dependent wake path remains removed.
 
 Install M5-STHS34PF80 **0.0.1**. Missing/failed initialization disables only TMOS; read failures and recovery are logged. Initialization uses a500ms deadline checked between I²C transactions. Restart after reconnecting an uninitialized unit.
 
 PERF retains `tmos_poll_max_us`, `last_us`, `calls` and `tmos_errors`, alongside all existing loop/UI/cache metrics.
 
+Set the sketch's `TMOS_DIAGNOSTICS` to `1` and rebuild to enable approximately1Hz `TMOS STATE:` flag/hold/freshness diagnostics. Default `0` excludes the detailed diagnostic code and buffers at compile time; normal PERF and sensor/context logic remain active.
+
 Gesture UNIT was evaluated but rejected as a production light-control input because of false positives. See [the device evaluation](docs/gesture-unit-evaluation.md).
+
+## Study environmental context (TMOS + DLight)
+
+Connect TMOS (`0x5A`) and DLight/BH1750FVI (`0x23`) to Port A with a Y-GROVE cable. Both share SDA GPIO21 / SCL GPIO22 at100kHz for unit transactions; the internal IMU bus is not reinitialized. DLight uses M5Unified `In_I2C.start/write/read/stop`, following the [official M5-DLight commands and lux conversion](https://github.com/m5stack/M5-DLight/blob/master/src/M5_DLight.cpp). No additional DLight library is required. The locally installed M5-DLight0.0.3 was inspected but is not linked; its raw-count `getLUX()` differs from the current official raw/1.2 conversion used here.
+
+| Sensor | Role / schedule |
+| --- | --- |
+| TMOS | Observe presence/motion; existing50ms DRDY check, ODR8Hz |
+| DLight | Observe illuminance; continuous high-resolution mode (`0x10`), read every1s; raw16-bit big-endian value /1.2 |
+| Physical C-long | Explicit ceiling-light toggle; existing MQTT, LED and sound |
+
+**TMOS/DLight never control the light or wake/sleep the display.** KEY UNIT is not included in this update; its explicit-input integration remains future work. Gesture remains removed.
+
+| Lux | Light state |
+| --- | --- |
+| `<50` | DARK |
+| `50–<300` | DIM |
+| `300–<1000` | NORMAL |
+| `>=1000` | BRIGHT |
+
+Adjust `App::DLIGHT_DARK_LUX`, `DLIGHT_NORMAL_LUX`, `DLIGHT_BRIGHT_LUX` after device measurements. Classification currently has no lux hysteresis. Occupancy is held for10s after the last successful presence=1 sample; motion is reported separately and does not extend occupancy. Raw negative samples do not immediately clear the hold. TMOS data expires after2s, DLight after3s, and a read error immediately invalidates that sensor until a successful ready sample/read. Missing sensors produce UNKNOWN, rather than assumed darkness/vacancy. Initialization is attempted at startup only; restart if a missing unit is reconnected.
+
+Valid observations yield `VACANT_DARK`, `VACANT_LIGHT`, `OCCUPIED_DARK`, or `OCCUPIED_LIGHT`; DIM/NORMAL/BRIGHT all count as LIGHT. If either sensor is invalid, combined context is `UNKNOWN`. This expresses sensor observations, not guaranteed human occupancy.
+
+MAIN adds illuminance and held occupancy at the bottom of its content area; invalid values show `LUX --` / `PRESENCE --`. The six pages and existing refresh timing are retained.
+
+MQTT publishes non-retained QoS0 snapshots to `home/env/study/context` on classification/occupancy/motion/validity changes, after reconnection, or every60s. Attempts are limited to once per1s; intermediate changes may be coalesced, and lux changes within the same class appear at the heartbeat. No offline queue is added. Existing connected PubSubClient publish is synchronous; network fault timing still requires device PERF checks.
+
+```json
+{"lux":327.4,"light_state":"NORMAL","occupied":true,"motion":false,"context":"OCCUPIED_LIGHT"}
+```
+
+Invalid lux is `null` with `light_state:"UNKNOWN"`; invalid presence/motion are `null`, and combined context is `UNKNOWN`. MQTT failure does not change observations or trigger light actions. Serial prints successful DLight readings once per1s (`DLIGHT: lux=327.4 state=NORMAL`), context transitions and read failure/recovery. PERF adds `dlight_poll_max_us`, `last_us`, `dlight_calls`, `dlight_errors`; this measures only the I²C read, excluding Serial/MQTT/LCD. Conversion completes in the sensor with no loop wait; physical I²C transactions remain synchronous under existing driver timeouts.
+
+No context SD log or DLight graph is added. Existing temperature/humidity and system CSV schemas, Graph/STATS caches, buttons, NVS, IMU and180s auto-off remain unchanged.
 
 ## IMU gestures
 
