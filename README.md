@@ -1,279 +1,228 @@
-**English** \| [日本語](README-ja.md)
+**English** | [日本語](README.ja.md)
 
-# M5GO SwitchBot EnvMonitor
+# M5GO SwitchBot EnvMonitor — v0.6.0
 
-An Arduino project that turns an M5Stack M5GO v2.7 into an
-always-available environmental monitor for a SwitchBot
-temperature/humidity sensor.
+An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant obtains SwitchBot temperature/humidity measurements and publishes them through an MQTT broker to the M5GO. The device displays current values, SD-backed history and statistics, and uses its built-in LEDs to indicate environmental warnings.
 
-Home Assistant receives the SwitchBot measurements and publishes them
-through MQTT (Mosquitto) to the M5GO. The device provides a two-column
-MAIN screen, a diagnostic STATUS screen, physical button controls, and
-automatic display backlight shutoff after three minutes of inactivity.
+## Features and architecture
 
-## Architecture
+`SwitchBot → Home Assistant → MQTT broker (e.g. Mosquitto) → M5GO`
 
-``` text
-SwitchBot temperature/humidity sensor
-        │
-        │ Bluetooth / SwitchBot integration
-        ▼
-Home Assistant
-        │
-        │ mqtt.publish
-        ▼
-Mosquitto
-        │
-        │ home/env/switchbot-b3d8/raw
-        ▼
-M5GO v2.7
+| Feature | Behavior |
+| --- | --- |
+| Current measurements | 320 × 240 MAIN screen; LIVE / STALE / OFFLINE / WAIT |
+| History | Compatible one-minute environment CSV; rolling 24-hour graphs |
+| Statistics | Temperature/humidity averages, minima, maxima and previous-window comparison |
+| Controls | A/B/C buttons, motion wake, held left/right tilt |
+| Environmental indicator | Built-in 10 LEDs; off in NORMAL, amber in WARNING, red in CRITICAL |
+| Black box | Separate system CSV for connectivity, heap, battery and data freshness |
+| Continuous operation | Automatic network retries; LCD backlight off after inactivity; ESP32 keeps running |
+| Rendering | 8-bit M5Canvas; embedded JetBrains Mono or FreeMono fallback |
+
+## Hardware and software
+
+| Hardware | Role |
+| --- | --- |
+| M5Stack M5GO v2.7 / ESP32 | Target device; continuously runs the main loop |
+| MPU6886 | Built-in acceleration sensor for wake and tilt |
+| SK6812 RGB ×10 | Built-in environmental indicator, GPIO15 |
+| microSD | Environment/system CSV; SD CS GPIO4, SPI at 25 MHz |
+| LCD | 320 × 240, rotation 1; backlight control |
+| A/B/C buttons | Physical controls remain available with IMU gestures |
+| Battery | Battery level (%) and voltage (mV) via M5.Power |
+| Wi-Fi | MQTT and NTP connectivity |
+
+A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
+
+The following is the supplied development environment, also listed by the previous README. The repository does not pin dependency versions or contain a build verification record for this documentation update.
+
+| Dependency | Version / use |
+| --- | --- |
+| ESP32 board package | 3.3.9; Arduino-ESP32 3.x RMT API |
+| M5Unified | 0.2.25 |
+| M5GFX | 0.2.32 |
+| PubSubClient | 2.8 |
+| ArduinoJson | 7.4.3 |
+| ESP32 bundled APIs | WiFi, Preferences, SD, SPI, time, heap diagnostics, RMT |
+
+No external RGB LED library is required.
+
+## Screens and buttons
+
+B short press cycles:
+
+`MAIN → SYSTEM STATUS → TEMP / 24H → HUM / 24H → TEMP / STATS → HUM / STATS → MAIN`
+
+| Page | Contents |
+| --- | --- |
+| MAIN (`ENV / B3D8`) | Latest temperature/humidity, data state and age |
+| SYSTEM STATUS | Wi-Fi RSSI/offline, MQTT, data age, environment state, SD, IMU, battery %, mV, uptime |
+| TEMP / 24H | Rolling 24-hour temperature graph from `/logs` |
+| HUM / 24H | Rolling 24-hour humidity graph from `/logs` |
+| TEMP / STATS | Temperature NOW, 24H AVG/MIN/MAX, PREV AVG, vs PREV |
+| HUM / STATS | Same statistics for humidity |
+
+| Button | Short press | Long press (800 ms) |
+| --- | --- | --- |
+| A | Display OFF | Cycle LCD brightness |
+| B | Next page | Reserved; registers activity only |
+| C | Return to MAIN | Reconnect Wi-Fi and MQTT |
+
+Short actions occur on release; long actions occur once while held and suppress the short action. While Display OFF, any short or long button action only wakes the display, keeping the current page; its normal action is consumed. Wake occurs at release for a short press or at 800 ms for a long press.
+
+LCD brightness cycles `40 → 80 → 120 → 160 → 220 → 40`; default is 160 and the setting is saved in NVS (`envmonitor` / `brightness`). The display refreshes approximately once a second while on, and also on valid MQTT receipt or button actions. Tilt changes the page and requests graph loading; the regular refresh renders it.
+
+The backlight turns off after 180 seconds without registered activity. Buttons, wake and successful tilt register activity; ordinary motion while on and MQTT receipt do not. This is backlight shutoff, not ESP32 sleep: MQTT, network recovery, NTP, SD logging, IMU and health monitoring continue. MQTT never wakes the display.
+
+## IMU gestures
+
+| Gesture / setting | Implementation |
+| --- | --- |
+| Sampling | Acceleration read approximately every 100 ms |
+| Motion wake (Display OFF) | Absolute difference between successive acceleration magnitudes ≥ 0.22 g; 3,000 ms wake cooldown |
+| Left tilt (Display ON) | Horizontal acceleration ≤ −0.55 g held for 500 ms → TEMP / 24H |
+| Right tilt (Display ON) | Horizontal acceleration ≥ +0.55 g held for 500 ms → HUM / 24H |
+| Tilt cooldown | 1,500 ms after a tilt action or motion wake |
+| Neutral / release | Absolute horizontal acceleration ≤ 0.30 g clears pending tilt and releases the latch |
+| Direction adjustment | `App::IMU_REVERSE_LEFT_RIGHT = false`; set true to invert X polarity for a reversed mounting orientation |
+
+Horizontal acceleration is accelerometer X (`ax`), optionally inverted; thresholds are acceleration components, not angles. A direction change starts a new hold; dropping below the tilt threshold cancels the pending hold. After an action, the latch prevents repeated switching until neutral is observed. Motion wake clears the hold and sets the latch, so the same movement cannot immediately switch pages. The first sample after display shutoff establishes the magnitude baseline. An unavailable IMU disables motion features while leaving buttons usable.
+
+User-reported device checks confirm left → TEMP / 24H, right → HUM / 24H and motion wake. These checks were not repeated during this documentation update.
+
+## Environmental thresholds and RGB LEDs
+
+Critical is evaluated first; either temperature or humidity can determine the state. Comparisons outside the ranges are strict (`<` / `>`).
+
+| State | Condition | LEDs |
+| --- | --- | --- |
+| NORMAL | Temperature 18–28 °C **and** humidity 40–70%, inclusive; also before any valid data | All off |
+| WARNING | Not CRITICAL, and temperature <18 or >28 °C **or** humidity <40 or >70% | First 3 amber; remaining 7 off |
+| CRITICAL | Temperature <15 or >32 °C **or** humidity <30 or >80% | All 10 red |
+
+Exactly 15/32 °C or 30/80% is WARNING unless another metric is CRITICAL. `RGB_LED_BRIGHTNESS = 12` is a channel intensity (0–255): amber RGB=(12,6,0), red RGB=(12,0,0). It is independent of LCD brightness. LEDs indicate abnormal conditions rather than decoration.
+
+GPIO15 uses Arduino-ESP32 RMT at 10 MHz, four memory blocks and 240 symbols/frame, with GRB byte order. Each bit is 0.4 µs HIGH + 0.8 µs LOW for 0, or 0.8 µs HIGH + 0.4 µs LOW for 1. Initialization clears all LEDs; RMT initialization/initial-clear failure disables RGB operation.
+
+LEDs update on valid MQTT receipt and remain independent of Display OFF. The state uses the last accepted values without freshness gating or hysteresis: an old warning can remain lit, and NORMAL does not guarantee connectivity or fresh data.
+
+## SD logging and black box
+
+```text
+/
+├── logs/
+│   └── YYYY-MM-DD.csv     # environment history; compatible schema
+└── system/
+    └── YYYY-MM-DD.csv     # system diagnostic black box
 ```
 
-Example MQTT payload:
+Both streams share a 60,000 ms logging check. Files use the local date (`TZ_INFO`, default JST) and append rows; a header is written only when a file does not exist. Each write closes the file. Logging requires available SD and a valid clock (`time >= 1704067200`, 2024-01-01 UTC). Before clock validity, neither stream writes and there is no unsynchronized file or later backfill. Clock validity is a timestamp test, not proof of a fresh NTP response.
 
-``` json
-{
-  "id": "switchbot-b3d8",
-  "temperature": 24.9,
-  "humidity": 62.0
-}
+`/logs` additionally requires at least one valid MQTT measurement. Once received, the last values continue to be logged even when STALE/OFFLINE; there is no freshness filter. `/system` records even in WAIT and is intended for later investigation of Wi-Fi/MQTT outages and memory conditions. These are periodic snapshots, not a complete event trace.
+
+### Environment CSV (unchanged)
+
+```csv
+timestamp,temperature,humidity,rssi,mqtt
 ```
 
-A one-minute heartbeat publish from Home Assistant is recommended in
-addition to state-change publishing. This allows the M5GO to monitor the
-health of the MQTT delivery path even when the measured values remain
-unchanged.
+| Field | Meaning |
+| --- | --- |
+| timestamp | Local `YYYY-MM-DD HH:MM:SS`, logging time |
+| temperature | Last accepted temperature in °C, one decimal |
+| humidity | Last accepted relative humidity in %, one decimal |
+| rssi | Wi-Fi RSSI in dBm; 0 when disconnected |
+| mqtt | 1 connected, 0 disconnected |
 
-## Features
+### System CSV
 
--   Receives SwitchBot temperature and humidity over MQTT
--   320 × 240 two-column MAIN display
--   STATUS page showing Wi-Fi, MQTT, data age, IP address, and uptime
--   Flicker-reduced rendering using an 8-bit `M5Canvas`
--   Automatic display backlight shutoff after three minutes without
-    button input
--   Wi-Fi, MQTT, and NTP continue running while the display is off
--   Incoming MQTT messages do not wake the display
--   Five brightness levels
--   Brightness is persisted in NVS using `Preferences`
--   JetBrains Mono support
--   FreeMono fallback when JetBrains Mono is unavailable
--   JST clock synchronized by NTP
--   LIVE / STALE / OFFLINE MQTT-data status
-
-## Button Controls
-
-  Button   Short press            Long press
-  -------- ---------------------- ------------------------
-  A        Display ON / OFF       Cycle brightness
-  B        Toggle MAIN / STATUS   Reserved
-  C        Return to MAIN         Reconnect Wi-Fi / MQTT
-
-When the display is off, the first press of **any** button only wakes
-the display. It does not execute the button's normal action. The latest
-received values are rendered immediately after wake-up.
-
-Brightness cycles through:
-
-``` text
-40 → 80 → 120 → 160 → 220 → 40 ...
+```csv
+timestamp,rssi,wifi,mqtt,heap,min_heap,largest_heap,battery_pct,battery_mv,data_state,data_age_s
 ```
 
-## Automatic Display Shutoff
+| Field | Meaning |
+| --- | --- |
+| timestamp | Same local logging timestamp format |
+| rssi | Wi-Fi RSSI in dBm; 0 when disconnected |
+| wifi | 1 when `WL_CONNECTED`, otherwise 0 |
+| mqtt | 1 connected, 0 disconnected |
+| heap | Current free heap, bytes (`ESP.getFreeHeap`) |
+| min_heap | Minimum free heap since boot, bytes (`ESP.getMinFreeHeap`) |
+| largest_heap | Largest allocatable 8-bit heap block, bytes |
+| battery_pct | M5.Power battery level, % |
+| battery_mv | M5.Power battery voltage, mV |
+| data_state | WAIT / LIVE / STALE / OFFLINE |
+| data_age_s | Seconds since last accepted MQTT receipt; 0 in WAIT |
 
-The backlight is switched off after 180 seconds without physical button
-activity.
+SD initialization failure disables logging and SD history while measurement display/network operation continue. Directory/file-open failures are reported to Serial and do not stop the main loop. There is no SD remount/recovery loop, buffering/backfill, retention cleanup, or verified write-byte/durability check; after later I/O failures the SD status may still say READY. Check Serial and files when diagnosing storage. Export/archive CSV externally as needed.
 
-``` text
-No button input for 3 minutes
-        ↓
-Display brightness = 0
-        ↓
-Wi-Fi / MQTT / NTP remain active
-```
+## Graphs and statistics
 
-This is not an ESP32 sleep mode. MQTT remains connected and the display
-can be restored immediately with a button press.
+Graphs read environment CSV into 288 five-minute buckets over a rolling 24-hour window. The last row read in each bucket wins (no bucket averaging); missing buckets break the line. Data reloads on entry via STATUS → TEMP / 24H, on tilt, or every five minutes while a graph page is visible. The vertical scale follows data with 15% padding (minimum 0.5). Empty graphs show `NO 24H DATA` or `SD UNAVAILABLE`.
 
-Because the M5GO v2.7 uses a TFT LCD, the project turns the backlight
-off instead of keeping a moving screensaver active.
+Statistics reread CSV at every statistics-page draw, using all parsed rows with finite values for each metric, independently of graph buckets, RSSI and MQTT flags.
 
-## Screens
+| Item | Calculation |
+| --- | --- |
+| NOW | Last accepted MQTT value, even if STALE/OFFLINE; does not require SD/time |
+| 24H AVG | Arithmetic mean of rows in `[now − 24 h, now]`; equal weight per row |
+| 24H MIN / MAX | Minimum / maximum in that same interval |
+| PREV AVG | Arithmetic mean in `[now − 48 h, now − 24 h)` |
+| vs PREV | Current 24H AVG minus PREV AVG; °C or humidity percentage points |
 
-### MAIN
+PREV is the preceding rolling 24-hour interval, **not the previous calendar day**. No interpolation, time weighting or completeness requirement is applied; stale values logged repeatedly contribute repeatedly. Missing SD/time or rows yields `--` for historical values; missing current data yields `--` for NOW. Temperature displays one decimal, humidity whole numbers; calculations use floats. Positive differences are orange, negative cyan.
 
-The default screen emphasizes the current temperature and humidity.
+## MQTT, configuration and operation
 
-``` text
-┌──────────────────────────────────────┐
-│ ENV / B3D8               10/05 06:10│
-│ ──────────────────────────────────── │
-│ TEMPERATURE       │     HUMIDITY     │
-│                   │                  │
-│     24.9          │        62        │
-│       C           │         %        │
-│                   │                  │
-│ ──────────────────────────────────── │
-│ ● MQTT  LIVE                 28s ago │
-└──────────────────────────────────────┘
-```
+Copy `config.example.h` to local `config.h` and edit locally:
 
-### STATUS
-
-The diagnostic page makes it possible to inspect basic connectivity
-without opening a serial monitor.
-
-``` text
-┌──────────────────────────────────────┐
-│ SYSTEM STATUS            10/05 06:10│
-│ ──────────────────────────────────── │
-│ Wi-Fi                       -57 dBm  │
-│ MQTT                      CONNECTED  │
-│ Sensor                         B3D8  │
-│ Data age                    28s ago  │
-│ IP                    192.168.3.xxx  │
-│ Uptime                      2h 14m   │
-│ ──────────────────────────────────── │
-│ ● MQTT                       v0.3.x  │
-└──────────────────────────────────────┘
-```
-
-## Environment
-
-Development/test configuration:
-
--   M5Stack M5GO v2.7
--   M5Stack ESP32 board package 3.3.9
--   M5Unified 0.2.25
--   M5GFX 0.2.32
--   PubSubClient 2.8
--   ArduinoJson 7.4.3
--   ESP32 `Preferences`
--   Wi-Fi
--   MQTT broker (Mosquitto assumed)
--   Home Assistant
--   SwitchBot temperature/humidity sensor
-
-## Project Layout
-
-``` text
-M5GO-SwitchBot-EnvMonitor/
-├── M5GO-SwitchBot-EnvMonitor.ino
-├── config.h
-├── config.example.h
-├── README.md
-├── README-ja.md
-├── .gitignore
-└── tools/
-    └── ...
-```
-
-`config.h` contains local Wi-Fi and MQTT credentials and must remain
-outside version control.
-
-## Configuration
-
-Copy the example configuration and edit it for your environment:
-
-``` bash
+```sh
 cp config.example.h config.h
 ```
 
-Example:
+Keep `config.h` ignored and never publish SSIDs, Wi-Fi/MQTT passwords or other credentials. Set `WIFI_SSID`, `WIFI_PASSWORD`, `MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD` for your environment without copying them into documentation. An empty MQTT username selects a connection without username/password.
 
-``` cpp
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+| Public configuration | Current default |
+| --- | --- |
+| `MQTT_TOPIC_ENV` | `home/env/switchbot-b3d8/raw` |
+| `MQTT_CLIENT_ID` | `m5go-switchbot-b3d8` (use a unique ID per device) |
+| `MQTT_PORT` | 1883 |
+| `TZ_INFO` | `JST-9` |
+| NTP servers | `ntp.nict.jp`, `ntp.jst.mfeed.ad.jp`, `pool.ntp.org` |
 
-#define MQTT_HOST "192.168.3.200"
-#define MQTT_PORT 1883
-
-#define MQTT_USERNAME "YOUR_MQTT_USERNAME"
-#define MQTT_PASSWORD "YOUR_MQTT_PASSWORD"
-
-#define MQTT_CLIENT_ID "m5go-switchbot-b3d8"
-#define MQTT_TOPIC_ENV "home/env/switchbot-b3d8/raw"
-
-#define TZ_INFO "JST-9"
-#define NTP_SERVER_1 "ntp.nict.jp"
-#define NTP_SERVER_2 "ntp.jst.mfeed.ad.jp"
-#define NTP_SERVER_3 "pool.ntp.org"
+```json
+{"id":"switchbot-b3d8","temperature":24.9,"humidity":62.0}
 ```
 
-Do not commit `config.h`.
+Only the configured topic is accepted, subscribed at QoS 0. JSON must have numeric temperature and humidity; finite temperature −50…80 °C and humidity 0…100% are accepted, inclusive. Invalid messages do not update values or receipt time. `id` is not validated or required; no measurement timestamp is consumed. The client buffer is 512 bytes. The firmware uses `WiFiClient` (no TLS), receives measurements and does not publish them.
 
-## Home Assistant / MQTT
+[Home Assistant example](home-assistant/switchbot-b3d8-mqtt.yaml) publishes on either entity's state change, Home Assistant startup and every minute, with a two-second delay, basic unavailable-state filtering, retain=true and QoS 0. Adapt the `sensor.meter_b3d8_temperature` / `sensor.meter_b3d8_humidity` entities locally. A retained old message is treated as newly received; data age measures the delivery path, not the underlying sensor measurement age.
 
-Example Home Assistant entities:
+| Network / reliability item | Implementation |
+| --- | --- |
+| Wi-Fi | STA; persistent configuration off, auto reconnect on, Wi-Fi sleep off |
+| Wi-Fi retry | Initial/manual connection wait 15 s; retry delays 5 → 10 → 20 → 40 → 60 s, capped; reset on connection |
+| MQTT retry | Only with Wi-Fi connected; failed attempts delayed 2 → 4 → 8 → 16 → 32 → 60 s, capped; reset on successful connect + subscribe |
+| MQTT connection | Keepalive 30 s; socket timeout 5 s; subscribe failure disconnects; Wi-Fi loss disconnects MQTT |
+| Freshness | WAIT before first valid message; LIVE <180 s; STALE 180–<600 s; OFFLINE ≥600 s |
+| NTP | `configTzTime` configured once when Wi-Fi becomes available; underlying time service handles synchronization |
+| Serial diagnostics | 115200 baud; boot reset reason and heap; network/error messages; HEALTH every 5 min |
+| HEALTH | Uptime, Wi-Fi/MQTT, RSSI, free/minimum/largest heap, data state/age, SD/IMU, battery, environment state |
 
-``` text
-sensor.meter_b3d8_temperature
-sensor.meter_b3d8_humidity
-```
+Retries use deadline checks and exponential backoff in the main loop. MQTT connect/socket operations and SD reads/writes are synchronous; this is not a guarantee of uninterrupted UI response. Heap is observed, with no automatic heap-triggered restart. Canvas allocation failure is fatal and stops setup; SD/IMU/RGB initialization failures are handled separately. No endurance test was performed for this documentation update.
 
-MQTT topic:
+## Repository and fonts
 
-``` text
-home/env/switchbot-b3d8/raw
-```
+| Path | Purpose |
+| --- | --- |
+| `M5GO-SwitchBot-EnvMonitor.ino` | Firmware; `App` constants are the implemented thresholds/timers |
+| `config.example.h` / local `config.h` | Configuration template / private settings |
+| `README.md` / `README.ja.md` | English / Japanese documentation |
+| `home-assistant/` | MQTT publisher example |
+| `JetBrainsMono*pt7b.h` | Embedded generated font headers |
+| `tools/install_jetbrains_mono.sh` | macOS font download/conversion helper |
+| `fonts/README.md`, `FONT-NOTICE.md`, `OFL-JetBrainsMono.txt` | Font instructions and license |
 
-Publishing is recommended when either sensor state changes, when Home
-Assistant starts, and once every minute as a heartbeat.
+Open the sketch in Arduino IDE with the M5GO-compatible ESP32 board selected and the dependencies installed. Generated font headers are already present; font regeneration is optional. No LittleFS font upload is used. All three headers must be available to select JetBrains Mono; otherwise the sketch uses M5GFX FreeMono fonts.
 
-Using `retain: true` lets the M5GO receive the last published values
-immediately after reconnecting.
-
-## Data Freshness
-
-The M5GO currently determines freshness from the time at which it
-receives an MQTT message.
-
-``` text
-0–179 seconds     LIVE
-180–599 seconds   STALE
-600+ seconds      OFFLINE
-```
-
-With a one-minute heartbeat, this primarily represents the health of the
-**Home Assistant → Mosquitto → M5GO** delivery path.
-
-It does not necessarily represent the age of the underlying SwitchBot
-measurement itself.
-
-## JetBrains Mono
-
-The UI is designed to support JetBrains Mono.
-
-The previous LittleFS + `loadFont()` implementation is not used because
-it caused a compatibility problem with the M5GFX 0.2.32 / ESP32 core
-3.3.9 combination.
-
-Instead, the project uses a firmware-embedded M5GFX / Adafruit GFX
-compatible font approach. If the generated JetBrains Mono font is
-unavailable, the application can fall back to the FreeMono fonts
-included with M5GFX.
-
-JetBrains Mono is distributed by JetBrains under the SIL Open Font
-License 1.1.
-
-## Security
-
-Never commit:
-
--   Wi-Fi SSIDs or passwords
--   MQTT usernames or passwords
--   Other environment-specific secrets
-
-Keep `config.h` in `.gitignore`.
-
-If it was previously tracked by Git, remove it from the index:
-
-``` bash
-git rm --cached config.h
-```
-
-## License
-
-The application source follows the license specified by this repository.
-
-JetBrains Mono is distributed under the SIL Open Font License 1.1.
+JetBrains Mono is under SIL OFL 1.1; see [font notice](FONT-NOTICE.md) and [OFL](OFL-JetBrainsMono.txt). The repository's `LICENSE` is currently empty, so an application license is not specified.
