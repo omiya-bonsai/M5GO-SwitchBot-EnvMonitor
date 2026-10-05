@@ -28,7 +28,7 @@
 
 namespace App {
 constexpr char NAME[] = "M5GO-SwitchBot-EnvMonitor";
-constexpr char VERSION[] = "0.6.0";
+constexpr char VERSION[] = "0.6.1";
 
 constexpr int SCREEN_WIDTH = 320;
 constexpr int SCREEN_HEIGHT = 240;
@@ -117,13 +117,14 @@ constexpr uint16_t DIVIDER = 0x3186;
 // Types
 // =============================================================================
 
-enum class Page {
-  Main,
-  Status,
-  TemperatureGraph,
-  HumidityGraph,
-  TemperatureStats,
-  HumidityStats,
+// Stable NVS page IDs; keep existing values when adding pages.
+enum class Page : uint8_t {
+  Main = 0,
+  Status = 1,
+  TemperatureGraph = 2,
+  HumidityGraph = 3,
+  TemperatureStats = 4,
+  HumidityStats = 5,
 };
 
 enum class DataState {
@@ -188,6 +189,7 @@ struct MetricStats {
 
 M5Canvas canvas(&M5.Display);
 Preferences preferences;
+bool preferencesAvailable = false;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
@@ -225,6 +227,20 @@ uint32_t tiltStartedMs = 0;
 float previousAccelMagnitude = NAN;
 TiltDirection pendingTilt = TiltDirection::None;
 bool tiltLatched = false;
+
+// =============================================================================
+// Persistent UI state
+// =============================================================================
+
+void setCurrentPage(Page page) {
+  if (page == currentPage) return;
+
+  currentPage = page;
+  if (preferencesAvailable &&
+      preferences.putUChar("page", static_cast<uint8_t>(page)) != 1) {
+    Serial.println("NVS: page save failed");
+  }
+}
 
 // =============================================================================
 // Time helpers
@@ -1103,13 +1119,13 @@ void performTiltAction(TiltDirection direction,
   if (direction == TiltDirection::None) return;
 
   if (direction == TiltDirection::Left) {
-    currentPage = Page::TemperatureGraph;
+    setCurrentPage(Page::TemperatureGraph);
     loadGraphData();
     Serial.printf(
       "IMU: tilt ax=%.2f ay=%.2f az=%.2f -> LEFT -> TEMP / 24H\n",
       ax, ay, az);
   } else {
-    currentPage = Page::HumidityGraph;
+    setCurrentPage(Page::HumidityGraph);
     loadGraphData();
     Serial.printf(
       "IMU: tilt ax=%.2f ay=%.2f az=%.2f -> RIGHT -> HUM / 24H\n",
@@ -1519,9 +1535,8 @@ void drawStatusPage() {
             imuAvailable ? Color::GREEN : Color::RED);
 
   drawSmall("Battery", LABEL_X, ROW_Y[6], middle_left, Color::MUTED);
-  snprintf(value, sizeof(value), "%d%% %dmV",
-           M5.Power.getBatteryLevel(),
-           M5.Power.getBatteryVoltage());
+  snprintf(value, sizeof(value), "%d%%",
+           M5.Power.getBatteryLevel());
   drawSmall(value, VALUE_X, ROW_Y[6], middle_right, Color::TEXT);
 
   drawSmall("Uptime", LABEL_X, ROW_Y[7], middle_left, Color::MUTED);
@@ -1633,23 +1648,39 @@ void wakeDisplay() {
   Serial.println("Display: wake");
 }
 
-void loadBrightness() {
-  brightnessIndex =
-    preferences.getUChar("brightness", App::DEFAULT_BRIGHTNESS_INDEX);
+void loadUiState() {
+  // Defaults also cover an unavailable namespace or missing/wrong-type keys.
+  currentPage = Page::Main;
+  brightnessIndex = App::DEFAULT_BRIGHTNESS_INDEX;
+  displaySleeping = false;  // Always show successful startup; OFF is not saved.
 
-  if (brightnessIndex >= App::BRIGHTNESS_LEVEL_COUNT) {
-    brightnessIndex = App::DEFAULT_BRIGHTNESS_INDEX;
+  if (!preferencesAvailable) return;
+
+  const uint8_t savedPage = preferences.getUChar("page", 0);
+  if (savedPage <= static_cast<uint8_t>(Page::HumidityStats)) {
+    currentPage = static_cast<Page>(savedPage);
+  }
+
+  const uint8_t savedBrightness =
+    preferences.getUChar("brightness", App::DEFAULT_BRIGHTNESS_INDEX);
+  if (savedBrightness < App::BRIGHTNESS_LEVEL_COUNT) {
+    brightnessIndex = savedBrightness;
   }
 }
 
 void cycleBrightness() {
-  brightnessIndex =
+  const uint8_t nextIndex =
     (brightnessIndex + 1) % App::BRIGHTNESS_LEVEL_COUNT;
+  if (nextIndex == brightnessIndex) return;
+  brightnessIndex = nextIndex;
 
   M5.Display.setBrightness(
     App::BRIGHTNESS_LEVELS[brightnessIndex]);
 
-  preferences.putUChar("brightness", brightnessIndex);
+  if (preferencesAvailable &&
+      preferences.putUChar("brightness", brightnessIndex) != 1) {
+    Serial.println("NVS: brightness save failed");
+  }
 
   Serial.printf("Display: brightness=%u\n",
                 App::BRIGHTNESS_LEVELS[brightnessIndex]);
@@ -1924,29 +1955,29 @@ void handleButtonBShort() {
 
   switch (currentPage) {
     case Page::Main:
-      currentPage = Page::Status;
+      setCurrentPage(Page::Status);
       break;
 
     case Page::Status:
-      currentPage = Page::TemperatureGraph;
+      setCurrentPage(Page::TemperatureGraph);
       loadGraphData();
       break;
 
     case Page::TemperatureGraph:
-      currentPage = Page::HumidityGraph;
+      setCurrentPage(Page::HumidityGraph);
       break;
 
     case Page::HumidityGraph:
-      currentPage = Page::TemperatureStats;
+      setCurrentPage(Page::TemperatureStats);
       break;
 
     case Page::TemperatureStats:
-      currentPage = Page::HumidityStats;
+      setCurrentPage(Page::HumidityStats);
       break;
 
     case Page::HumidityStats:
     default:
-      currentPage = Page::Main;
+      setCurrentPage(Page::Main);
       break;
   }
 
@@ -1970,7 +2001,7 @@ void handleButtonCShort() {
   }
 
   registerUserActivity();
-  currentPage = Page::Main;
+  setCurrentPage(Page::Main);
   drawScreen();
 }
 
@@ -2066,7 +2097,7 @@ void logHealthIfDue(uint32_t now) {
   Serial.printf(
     "HEALTH: uptime=%s wifi=%s mqtt=%s rssi=%d "
     "heap=%u min_heap=%u largest=%u data=%s age_s=%lu "
-    "sd=%s imu=%s battery=%d%%/%dmV env=%s\n",
+    "sd=%s imu=%s battery=%d%% env=%s\n",
     uptime,
     WiFi.status() == WL_CONNECTED ? "up" : "down",
     mqttClient.connected() ? "up" : "down",
@@ -2081,7 +2112,6 @@ void logHealthIfDue(uint32_t now) {
     sdAvailable ? "ready" : "offline",
     imuAvailable ? "ready" : "offline",
     M5.Power.getBatteryLevel(),
-    M5.Power.getBatteryVoltage(),
     environmentStateText(getEnvironmentState()));
 }
 
@@ -2092,8 +2122,11 @@ void logHealthIfDue(uint32_t now) {
 void setupDisplay() {
   M5.Display.setRotation(1);
 
-  preferences.begin("envmonitor", false);
-  loadBrightness();
+  preferencesAvailable = preferences.begin("envmonitor", false);
+  if (!preferencesAvailable) {
+    Serial.println("NVS: unavailable - UI persistence disabled");
+  }
+  loadUiState();
 
   M5.Display.setBrightness(
     App::BRIGHTNESS_LEVELS[brightnessIndex]);
@@ -2121,8 +2154,7 @@ void setupDisplay() {
 
   lastUserActivityMs = millis();
   lastDisplayRefreshMs = millis();
-
-  drawScreen();
+  // First page draw is deferred until SD and the other peripherals are ready.
 }
 
 // =============================================================================
@@ -2149,6 +2181,12 @@ void setup() {
   initializeSdCard();
   configureMQTT();
   configureWiFi();
+
+  // Graph loading is guarded by SD/clock validity; retry on later redraws
+  // once NTP provides a valid clock. Statistics are loaded by drawScreen().
+  drawScreen();
+  lastUserActivityMs = millis();
+  lastDisplayRefreshMs = millis();
 }
 
 void loop() {

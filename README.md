@@ -1,6 +1,6 @@
 **English** | [日本語](README.ja.md)
 
-# M5GO SwitchBot EnvMonitor — v0.6.0
+# M5GO SwitchBot EnvMonitor — v0.6.1
 
 An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant obtains SwitchBot temperature/humidity measurements and publishes them through an MQTT broker to the M5GO. The device displays current values, SD-backed history and statistics, and uses its built-in LEDs to indicate environmental warnings.
 
@@ -14,6 +14,7 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 | History | Compatible one-minute environment CSV; rolling 24-hour graphs |
 | Statistics | Temperature/humidity averages, minima, maxima and previous-window comparison |
 | Controls | A/B/C buttons, motion wake, held left/right tilt |
+| UI restoration | Page and brightness persisted in NVS; startup Display ON |
 | Environmental indicator | Built-in 10 LEDs; off in NORMAL, amber in WARNING, red in CRITICAL |
 | Black box | Separate system CSV for connectivity, heap, battery and data freshness |
 | Continuous operation | Automatic network retries; LCD backlight off after inactivity; ESP32 keeps running |
@@ -29,12 +30,12 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 | microSD | Environment/system CSV; SD CS GPIO4, SPI at 25 MHz |
 | LCD | 320 × 240, rotation 1; backlight control |
 | A/B/C buttons | Physical controls remain available with IMU gestures |
-| Battery | Battery level (%) and voltage (mV) via M5.Power |
+| Battery | Battery level (%) via M5.Power; raw voltage retained only in system CSV |
 | Wi-Fi | MQTT and NTP connectivity |
 
 A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
 
-The following is the supplied development environment, also listed by the previous README. The repository does not pin dependency versions or contain a build verification record for this documentation update.
+The following is the supplied target environment. The repository does not pin dependency versions. v0.6.1 also compiled successfully with the locally installed M5Stack ESP32 package 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28, PubSubClient 2.8 and ArduinoJson 7.4.3 (`m5stack:esp32:m5stack_core`, placeholder configuration). This does not verify the exact M5Unified 0.2.25 / M5GFX 0.2.32 combination or device behavior.
 
 | Dependency | Version / use |
 | --- | --- |
@@ -56,7 +57,7 @@ B short press cycles:
 | Page | Contents |
 | --- | --- |
 | MAIN (`ENV / B3D8`) | Latest temperature/humidity, data state and age |
-| SYSTEM STATUS | Wi-Fi RSSI/offline, MQTT, data age, environment state, SD, IMU, battery %, mV, uptime |
+| SYSTEM STATUS | Wi-Fi RSSI/offline, MQTT, data age, environment state, SD, IMU, battery %, uptime |
 | TEMP / 24H | Rolling 24-hour temperature graph from `/logs` |
 | HUM / 24H | Rolling 24-hour humidity graph from `/logs` |
 | TEMP / STATS | Temperature NOW, 24H AVG/MIN/MAX, PREV AVG, vs PREV |
@@ -74,6 +75,25 @@ LCD brightness cycles `40 → 80 → 120 → 160 → 220 → 40`; default is 160
 
 The backlight turns off after 180 seconds without registered activity. Buttons, wake and successful tilt register activity; ordinary motion while on and MQTT receipt do not. This is backlight shutoff, not ESP32 sleep: MQTT, network recovery, NTP, SD logging, IMU and health monitoring continue. MQTT never wakes the display.
 
+## Restart and UI restoration (v0.6.1)
+
+USB removal has been observed to briefly interrupt power and restart the ESP32 with `POWERON_RESET`, even with the IP5306 boost keep-on experiment. v0.6.1 restores UI preferences after a restart; it does not guarantee uninterrupted USB-to-battery switching. The temporary IP5306 experiment was removed; ordinary M5Unified power initialization is used.
+
+| NVS item | Stored value / policy |
+| --- | --- |
+| Namespace | Existing `envmonitor` |
+| `page` | Unsigned byte: MAIN=0, STATUS=1, TEMP / 24H=2, HUM / 24H=3, TEMP / STATS=4, HUM / STATS=5 |
+| `brightness` | Existing unsigned-byte index 0–4 for 40/80/120/160/220 |
+| Display ON/OFF | Not saved; startup always ON so a successful boot remains visible |
+
+Missing, wrong-type or out-of-range values fall back to MAIN and brightness 160. Existing brightness settings remain compatible. NVS is written only when the page actually changes through B/C or IMU, or A-long changes brightness. Re-selecting the current page does not write. Boot restoration, redraws, MQTT receipt, normal loop iterations, wake and automatic/manual display shutoff do not write. Failed NVS initialization leaves defaults and disables persistence; failed writes are logged without stopping operation. A power loss before a write commits can leave the previous saved state.
+
+Startup order remains M5 initialization → LCD/NVS state load and 8-bit canvas allocation → IMU → RGB → SD → MQTT configuration → Wi-Fi connection start → first restored-page draw. No restored page is drawn before SD initialization. Graph loading waits for valid SD/time and retries on graph redraws after NTP; statistics are calculated on draw. Until time/data is available, empty-history indicators or `--` can appear. The 180-second activity timer starts again after startup.
+
+Wi-Fi and MQTT reconnect normally, subscribe, and reacquire environmental values from retained MQTT. Temperature/humidity, measurement age, time, RSSI, network/session state and graph data are not saved in NVS; they are rebuilt from MQTT, time services and SD. Freshness is still measured from valid receipt time.
+
+SYSTEM STATUS and HEALTH show battery percentage only. The v0.6.0 `/system` CSV schema retains `battery_mv` for compatibility with deployed logs; its observed 0 is an unavailable/useless reading, not proof of an empty battery. No CSV columns or paths were removed.
+
 ## IMU gestures
 
 | Gesture / setting | Implementation |
@@ -88,7 +108,7 @@ The backlight turns off after 180 seconds without registered activity. Buttons, 
 
 Horizontal acceleration is accelerometer X (`ax`), optionally inverted; thresholds are acceleration components, not angles. A direction change starts a new hold; dropping below the tilt threshold cancels the pending hold. After an action, the latch prevents repeated switching until neutral is observed. Motion wake clears the hold and sets the latch, so the same movement cannot immediately switch pages. The first sample after display shutoff establishes the magnitude baseline. An unavailable IMU disables motion features while leaving buttons usable.
 
-User-reported device checks confirm left → TEMP / 24H, right → HUM / 24H and motion wake. These checks were not repeated during this documentation update.
+User-reported device checks confirm left → TEMP / 24H, right → HUM / 24H and motion wake. These checks were not repeated during this v0.6.1 update.
 
 ## Environmental thresholds and RGB LEDs
 
@@ -150,7 +170,7 @@ timestamp,rssi,wifi,mqtt,heap,min_heap,largest_heap,battery_pct,battery_mv,data_
 | min_heap | Minimum free heap since boot, bytes (`ESP.getMinFreeHeap`) |
 | largest_heap | Largest allocatable 8-bit heap block, bytes |
 | battery_pct | M5.Power battery level, % |
-| battery_mv | M5.Power battery voltage, mV |
+| battery_mv | Raw M5.Power battery voltage, mV; observed as 0 on this M5GO v2.7 configuration, not a meaningful voltage reading |
 | data_state | WAIT / LIVE / STALE / OFFLINE |
 | data_age_s | Seconds since last accepted MQTT receipt; 0 in WAIT |
 
@@ -209,7 +229,7 @@ Only the configured topic is accepted, subscribed at QoS 0. JSON must have numer
 | Serial diagnostics | 115200 baud; boot reset reason and heap; network/error messages; HEALTH every 5 min |
 | HEALTH | Uptime, Wi-Fi/MQTT, RSSI, free/minimum/largest heap, data state/age, SD/IMU, battery, environment state |
 
-Retries use deadline checks and exponential backoff in the main loop. MQTT connect/socket operations and SD reads/writes are synchronous; this is not a guarantee of uninterrupted UI response. Heap is observed, with no automatic heap-triggered restart. Canvas allocation failure is fatal and stops setup; SD/IMU/RGB initialization failures are handled separately. No endurance test was performed for this documentation update.
+Retries use deadline checks and exponential backoff in the main loop. MQTT connect/socket operations and SD reads/writes are synchronous; this is not a guarantee of uninterrupted UI response. Heap is observed, with no automatic heap-triggered restart. Canvas allocation failure is fatal and stops setup; SD/IMU/RGB initialization failures are handled separately. No device/endurance test was performed for this v0.6.1 update.
 
 ## Repository and fonts
 

@@ -1,6 +1,6 @@
 [English](README.md) | **日本語**
 
-# M5GO SwitchBot EnvMonitor — v0.6.0
+# M5GO SwitchBot EnvMonitor — v0.6.1
 
 M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジェクトです。Home Assistant が取得した SwitchBot の温湿度を MQTT broker 経由で受信し、現在値、SD 上の履歴・統計を表示します。内蔵 LED は環境異常のインジケーターとして使います。
 
@@ -14,6 +14,7 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 | 履歴 | 互換性を維持した1分間隔の環境 CSV、直近24時間グラフ |
 | 統計 | 温湿度の平均・最小・最大、前の24時間との比較 |
 | 操作 | A/B/C ボタン、モーション Wake、左右傾斜の HOLD |
+| UI 復元 | ページと輝度を NVS に保存、起動時 Display ON |
 | 環境インジケーター | 内蔵10灯、NORMAL 消灯／WARNING アンバー／CRITICAL 赤 |
 | ブラックボックス | 通信・heap・バッテリー・データ鮮度の独立したシステム CSV |
 | 常時運用 | 通信自動再接続、無操作時 LCD 消灯、ESP32 は継続動作 |
@@ -29,12 +30,12 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 | microSD | 環境／システム CSV、CS GPIO4、SPI 25 MHz |
 | LCD | 320 × 240、rotation 1、バックライト制御 |
 | A/B/C buttons | IMU 操作と併用可能な物理ボタン |
-| Battery | M5.Power による残量 %・電圧 mV の取得 |
+| Battery | M5.Power による残量 %、電圧の生値はシステム CSV のみ維持 |
 | Wi-Fi | MQTT と NTP の通信 |
 
 Charger Base は任意であり、ファームウェア動作の必須要件ではありません。常時運用には適切な電源が必要です。バッテリー持続時間は規定していません。
 
-以下は今回提示された開発環境で、旧 README の記録とも一致します。リポジトリに依存バージョンの固定設定はなく、今回のドキュメント更新ではビルド検証していません。
+以下は提示された対象環境です。リポジトリに依存バージョンの固定設定はありません。v0.6.1 はローカル導入済みの M5Stack ESP32 package 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、PubSubClient 2.8、ArduinoJson 7.4.3 でビルド成功しました（`m5stack:esp32:m5stack_core`、プレースホルダー設定）。指定の M5Unified 0.2.25／M5GFX 0.2.32 の組み合わせや実機動作を検証したものではありません。
 
 | 依存ソフトウェア | バージョン／用途 |
 | --- | --- |
@@ -56,7 +57,7 @@ B 短押しによる循環順序：
 | ページ | 内容 |
 | --- | --- |
 | MAIN（`ENV / B3D8`） | 最新温湿度、data state、data age |
-| SYSTEM STATUS | Wi-Fi RSSI／offline、MQTT、data age、環境状態、SD、IMU、バッテリー %・mV、uptime |
+| SYSTEM STATUS | Wi-Fi RSSI／offline、MQTT、data age、環境状態、SD、IMU、バッテリー %、uptime |
 | TEMP / 24H | `/logs` による直近24時間の温度グラフ |
 | HUM / 24H | `/logs` による直近24時間の湿度グラフ |
 | TEMP / STATS | 温度 NOW、24H AVG/MIN/MAX、PREV AVG、vs PREV |
@@ -74,6 +75,25 @@ LCD 輝度は `40 → 80 → 120 → 160 → 220 → 40`。初期値160、NVS（
 
 最後の操作時刻から180秒でバックライトを消灯します。ボタン、Wake、成立した傾斜操作が操作時刻を更新します。点灯中の通常の動きや MQTT 受信では更新しません。ESP32 の Sleep ではなく、消灯中も通信・再接続・NTP・SD ログ・IMU・HEALTH 監視を継続します。MQTT 受信で Display を Wake しません。
 
+## 再起動後の UI 状態復元（v0.6.1）
+
+USB 抜去時には一瞬の電源断と ESP32 の `POWERON_RESET` が観測され、IP5306 boost keep-on の検証でも解消していません。v0.6.1 は再起動後に UI 設定を復元するもので、USB→バッテリーの完全無停止切替を保証しません。一時的な IP5306 検証処理は削除し、通常の M5Unified 電源初期化を使用します。
+
+| NVS 項目 | 保存値／方針 |
+| --- | --- |
+| namespace | 既存の `envmonitor` |
+| `page` | unsigned byte：MAIN=0、STATUS=1、TEMP / 24H=2、HUM / 24H=3、TEMP / STATS=4、HUM / STATS=5 |
+| `brightness` | 既存の unsigned-byte index 0〜4、40/80/120/160/220 に対応 |
+| Display ON/OFF | 保存せず起動時は必ず ON。正常起動が見えなくなるのを防ぐため |
+
+キー欠落、型不一致、範囲外の値は MAIN／輝度160へフォールバックします。既存の輝度保存値も引き継ぎます。NVS は B/C または IMU でページが実際に変わったとき、および A 長押しで輝度が変わったときだけ書き込みます。同じページの再選択は保存しません。起動時の復元、再描画、MQTT 受信、通常の loop、Wake、自動／手動消灯では書き込みません。NVS 初期化失敗時は既定値で継続して永続化を無効にし、保存失敗時もログを出して動作を継続します。書き込み確定前の電源断では、前の保存値が残る可能性があります。
+
+起動順序は M5 初期化 → LCD/NVS 状態読み込み・8-bit canvas 確保 → IMU → RGB → SD → MQTT 設定 → Wi-Fi 接続開始 → 復元ページの初回描画です。SD 初期化前に復元ページを描画しません。グラフ読み込みは SD／時計が有効になるまで待ち、NTP 後のグラフ再描画で再試行します。統計は描画時に計算します。時刻やデータが得られるまでは履歴なし表示や `--` になります。180秒の無操作タイマーは起動後に開始し直します。
+
+Wi-Fi／MQTT は通常どおり再接続・subscribe し、retained MQTT から環境値を再取得します。温湿度、data age、時刻、RSSI、通信／セッション状態、グラフデータは NVS に保存せず、MQTT・時刻サービス・SD から再構築します。鮮度判定は従来どおり有効な受信時刻が基準です。
+
+SYSTEM STATUS と HEALTH のバッテリー表示は残量%のみです。運用済みログとの互換性のため、`/system` CSV は v0.6.0 の `battery_mv` 列を維持します。観測された0は電圧取得不可／無意味な値であり、バッテリーが空という意味ではありません。CSV 列や保存先は削除していません。
+
 ## IMU ジェスチャー
 
 | 操作／設定 | 実装 |
@@ -88,7 +108,7 @@ LCD 輝度は `40 → 80 → 120 → 160 → 220 → 40`。初期値160、NVS（
 
 水平判定は加速度 X（`ax`、必要なら符号反転）です。閾値は角度ではなく加速度成分です。方向が変われば HOLD を開始し直し、傾斜閾値未満に戻れば保留中の HOLD を取り消します。成立後は neutral に戻るまで latch で再操作を防止します。モーション Wake 後は HOLD を消去して latch を設定し、同じ動きで即座にページが変わるのを防ぎます。消灯後の最初のサンプルは加速度の基準値を設定します。IMU 初期化で加速度を取得できない場合はモーション機能を無効にし、ボタン操作は利用可能です。
 
-ユーザーによる実機確認済みの動作は、左 → TEMP / 24H、右 → HUM / 24H、モーション Wake です。今回のドキュメント更新では実機確認を繰り返していません。
+ユーザーによる実機確認済みの動作は、左 → TEMP / 24H、右 → HUM / 24H、モーション Wake です。今回の v0.6.1 更新では実機確認を繰り返していません。
 
 ## 環境閾値と RGB LED
 
@@ -150,7 +170,7 @@ timestamp,rssi,wifi,mqtt,heap,min_heap,largest_heap,battery_pct,battery_mv,data_
 | min_heap | 起動後の minimum free heap、bytes（`ESP.getMinFreeHeap`） |
 | largest_heap | 最大の割り当て可能な8-bit heap block、bytes |
 | battery_pct | M5.Power のバッテリー残量 % |
-| battery_mv | M5.Power のバッテリー電圧 mV |
+| battery_mv | M5.Power の電圧の生値 mV。この M5GO v2.7 構成では0を観測し、有効な電圧値ではない |
 | data_state | WAIT / LIVE / STALE / OFFLINE |
 | data_age_s | 最後の有効 MQTT 受信からの秒数、WAIT は0 |
 
@@ -209,7 +229,7 @@ cp config.example.h config.h
 | Serial 診断 | 115200 baud、起動時 reset reason／heap、通信・エラー、5分ごと HEALTH |
 | HEALTH | uptime、Wi-Fi/MQTT、RSSI、free/minimum/largest heap、data state/age、SD/IMU、battery、環境状態 |
 
-再試行はメインループの期限判定と exponential backoff で制御します。MQTT connect/socket 操作や SD 読み書きは同期処理であり、UI の無停止応答を保証するものではありません。heap は監視しますが、heap を理由とする自動再起動はありません。canvas 確保失敗は fatal で setup を停止します。SD/IMU/RGB 初期化失敗は個別に処理します。今回のドキュメント更新では耐久運転試験を行っていません。
+再試行はメインループの期限判定と exponential backoff で制御します。MQTT connect/socket 操作や SD 読み書きは同期処理であり、UI の無停止応答を保証するものではありません。heap は監視しますが、heap を理由とする自動再起動はありません。canvas 確保失敗は fatal で setup を停止します。SD/IMU/RGB 初期化失敗は個別に処理します。今回の v0.6.1 更新では実機／耐久運転試験を行っていません。
 
 ## リポジトリとフォント
 
