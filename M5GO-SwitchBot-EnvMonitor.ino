@@ -213,6 +213,14 @@ RetryState mqttRetry{ 0, App::MQTT_RETRY_MIN_MS };
 
 GraphPoint graphPoints[App::GRAPH_POINT_COUNT];
 
+// Historical results only; NOW continues to use the latest MQTT sample.
+struct StatsCache {
+  MetricStats temperature, humidity;
+  bool valid = false, dirty = true;
+  time_t calculatedAt = 0;
+};
+StatsCache statsCache;
+
 bool displaySleeping = false;
 bool timeConfigured = false;
 bool timeReadyLogged = false;
@@ -239,6 +247,86 @@ float previousAccelMagnitude = NAN;
 TiltDirection pendingTilt = TiltDirection::None;
 bool tiltLatched = false;
 
+// Diagnostic instrumentation only; cumulative counters since boot, times in us.
+namespace Perf {
+struct Timing {
+  uint32_t last = 0, maximum = 0, calls = 0;
+  void add(uint32_t us) { last = us; if (us > maximum) maximum = us; ++calls; }
+};
+struct Latency {
+  uint32_t maximum = 0, over[5] = {};
+  void add(uint32_t us) {
+    if (us > maximum) maximum = us;
+    constexpr uint32_t limits[] = {20000, 50000, 100000, 500000, 1000000};
+    for (unsigned i = 0; i < 5; ++i) if (us > limits[i]) ++over[i];
+  }
+};
+Timing stats, graph, draw, push, mqttConnect, mqttLoop, sdlog, nvs, output;
+Latency gap, loop;
+uint32_t cacheHit = 0, cacheMiss = 0, cacheRefresh = 0;
+uint32_t lastUpdate = 0;
+bool haveUpdate = false, bChanging = false;
+uint32_t* csvFiles = nullptr;
+uint32_t* csvLines = nullptr;
+uint32_t statsFiles = 0, statsLines = 0, graphFiles = 0, graphLines = 0;
+const char* pageName(Page p) {
+  constexpr const char* names[] = {"MAIN", "SYSTEM_STATUS", "TEMP_24H",
+    "HUM_24H", "TEMP_STATS", "HUM_STATS"};
+  return names[static_cast<uint8_t>(p)];
+}
+struct Scope {
+  Timing& metric; uint32_t start;
+  explicit Scope(Timing& m) : metric(m), start(micros()) {}
+  ~Scope() { metric.add(static_cast<uint32_t>(micros() - start)); }
+};
+// Spread summary over loops. One complete line only when UART TX has room.
+void summary() {
+  static uint32_t lastSummary = 0;
+  static uint8_t row = 0;
+  static char text[192];
+  static size_t length = 0, offset = 0;
+  const uint32_t begin = micros();
+  if (row == 0 && static_cast<uint32_t>(millis() - lastSummary) >= 10000) {
+    lastSummary = millis(); row = 1;
+  }
+  if (!row) return;
+  if (offset == length) {
+    offset = 0;
+    if (row == 1) {
+      length = snprintf(text, sizeof(text), "PERF SUMMARY uptime=%lu page=%s cumulative units=us\n",
+        (unsigned long)(millis()/1000), pageName(currentPage));
+    } else if (row == 13) {
+      length = snprintf(text, sizeof(text), "stats_cache hit=%lu miss=%lu refresh=%lu dirty=%u valid=%u\n",
+        (unsigned long)cacheHit, (unsigned long)cacheMiss, (unsigned long)cacheRefresh,
+        statsCache.dirty ? 1U : 0U, statsCache.valid ? 1U : 0U);
+    } else if (row <= 3) {
+      const Latency& m = row == 2 ? gap : loop;
+      length = snprintf(text, sizeof(text), "%s max=%lu >20=%lu >50=%lu >100=%lu >500=%lu >1000=%lu\n",
+        row == 2 ? "update_gap" : "loop", (unsigned long)m.maximum,
+        (unsigned long)m.over[0], (unsigned long)m.over[1], (unsigned long)m.over[2],
+        (unsigned long)m.over[3], (unsigned long)m.over[4]);
+    } else {
+      Timing* metrics[] = {&stats,&graph,&draw,&push,&mqttConnect,&mqttLoop,&sdlog,&nvs,&output};
+      const char* names[] = {"stats","graph","draw","push","mqtt_connect","mqtt_loop","sdlog","nvs_page","perf_output"};
+      const unsigned i = row - 4;
+      const Timing& m = *metrics[i];
+      length = snprintf(text, sizeof(text), "%s last=%lu max=%lu calls=%lu",
+        names[i], (unsigned long)m.last, (unsigned long)m.maximum, (unsigned long)m.calls);
+      if (i < 2) length += snprintf(text + length, sizeof(text) - length,
+        " files=%lu lines=%lu", (unsigned long)(i ? graphFiles : statsFiles),
+        (unsigned long)(i ? graphLines : statsLines));
+      length += snprintf(text + length, sizeof(text) - length, "\n");
+    }
+  }
+  int room = Serial.availableForWrite();
+  if (room >= static_cast<int>(length - offset)) {
+    offset += Serial.write(reinterpret_cast<const uint8_t*>(text + offset), length - offset);
+  }
+  if (offset == length) { if (++row > 13) row = 0; }
+  output.add(static_cast<uint32_t>(micros() - begin));
+}
+}  // namespace Perf
+
 // =============================================================================
 // Persistent UI state
 // =============================================================================
@@ -246,10 +334,15 @@ bool tiltLatched = false;
 void setCurrentPage(Page page) {
   if (page == currentPage) return;
 
+  const Page previous = currentPage;
   currentPage = page;
-  if (preferencesAvailable &&
-      preferences.putUChar("page", static_cast<uint8_t>(page)) != 1) {
-    Serial.println("NVS: page save failed");
+  if (Perf::bChanging) Serial.printf("PERF B page t=%lu %s->%s\n",
+    (unsigned long)millis(), Perf::pageName(previous), Perf::pageName(page));
+  if (preferencesAvailable) {
+    Perf::Scope timer(Perf::nvs);
+    if (preferences.putUChar("page", static_cast<uint8_t>(page)) != 1) {
+      Serial.println("NVS: page save failed");
+    }
   }
 }
 
@@ -944,14 +1037,17 @@ bool appendEnvironmentLog() {
 
   const int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
 
-  file.printf("%s,%.1f,%.1f,%d,%d\n",
+  const size_t written = file.printf("%s,%.1f,%.1f,%d,%d\n",
               timestamp,
               sensorData.temperature,
               sensorData.humidity,
               rssi,
               mqttClient.connected() ? 1 : 0);
 
+  const bool saved = written > 0 && file.getWriteError() == 0;
   file.close();
+  if (!saved) return false;
+  statsCache.dirty = true;
 
   Serial.printf("SD: logged %s %.1f C %.1f %%\n",
                 timestamp,
@@ -1011,6 +1107,7 @@ void maintainSdLogging(uint32_t now) {
 
   if (!intervalElapsed(now, lastSdLogMs, App::SD_LOG_INTERVAL_MS)) return;
 
+  Perf::Scope timer(Perf::sdlog);
   lastSdLogMs = now;
 
   if (sensorData.valid) appendEnvironmentLog();
@@ -1102,6 +1199,7 @@ void readCsvFileLines(const char* path, LineHandler handler) {
     return;
   }
 
+  if (Perf::csvFiles) ++*Perf::csvFiles;
   file.readStringUntil('\n');
 
   char lineBuffer[160];
@@ -1117,7 +1215,10 @@ void readCsvFileLines(const char* path, LineHandler handler) {
 
     lineBuffer[index] = '\0';
 
-    if (index > 0) handler(lineBuffer);
+    if (index > 0) {
+      if (Perf::csvLines) ++*Perf::csvLines;
+      handler(lineBuffer);
+    }
   }
 
   file.close();
@@ -1151,6 +1252,8 @@ void loadEnvironmentFilesForRange(time_t rangeStart,
 }
 
 void loadGraphData() {
+  Perf::Scope timer(Perf::graph);
+  Perf::graphFiles = Perf::graphLines = 0;
   if (!sdAvailable || !isClockValid()) return;
 
   clearGraphPoints();
@@ -1158,7 +1261,9 @@ void loadGraphData() {
   const time_t windowEnd = time(nullptr);
   const time_t windowStart = windowEnd - (24UL * 60UL * 60UL);
 
+  Perf::csvFiles = &Perf::graphFiles; Perf::csvLines = &Perf::graphLines;
   loadEnvironmentFilesForRange(windowStart, windowEnd, loadGraphFile);
+  Perf::csvFiles = Perf::csvLines = nullptr;
 
   lastGraphReloadMs = millis();
   Serial.println("GRAPH: 24h data loaded");
@@ -1246,6 +1351,8 @@ void processStatsFile(const char* path, time_t rangeStart, time_t rangeEnd) {
 
 void calculateStats(MetricStats& temperatureStats,
                     MetricStats& humidityStats) {
+  Perf::Scope timer(Perf::stats);
+  Perf::statsFiles = Perf::statsLines = 0;
   resetMetricStats(temperatureStats);
   resetMetricStats(humidityStats);
 
@@ -1266,7 +1373,9 @@ void calculateStats(MetricStats& temperatureStats,
   statsContext.currentStart = currentStart;
   statsContext.end = end;
 
+  Perf::csvFiles = &Perf::statsFiles; Perf::csvLines = &Perf::statsLines;
   loadEnvironmentFilesForRange(previousStart, end, processStatsFile);
+  Perf::csvFiles = Perf::csvLines = nullptr;
 }
 
 // =============================================================================
@@ -1526,12 +1635,10 @@ void drawGraph(bool temperature) {
 // =============================================================================
 
 void drawStatsPage(bool temperature) {
-  MetricStats temperatureStats;
-  MetricStats humidityStats;
-
-  calculateStats(temperatureStats, humidityStats);
-
-  MetricStats& stats = temperature ? temperatureStats : humidityStats;
+  if (statsCache.valid) ++Perf::cacheHit;
+  MetricStats stats = temperature ? statsCache.temperature : statsCache.humidity;
+  stats.current = sensorData.valid
+    ? (temperature ? sensorData.temperature : sensorData.humidity) : NAN;
   const uint16_t valueColor = temperature ? Color::ORANGE : Color::CYAN;
   const char* unit = temperature ? "C" : "%";
 
@@ -1750,6 +1857,7 @@ void drawFooter() {
 }
 
 void drawScreen() {
+  Perf::Scope timer(Perf::draw);
   if (displaySleeping) return;
 
   reloadGraphIfNeeded();
@@ -1779,7 +1887,31 @@ void drawScreen() {
   }
 
   drawFooter();
-  canvas.pushSprite(0, 0);
+  { Perf::Scope transfer(Perf::push);
+    canvas.pushSprite(0, 0);
+  }
+  lastDisplayRefreshMs = millis();
+}
+
+// Deliberately outside drawScreen/MQTT callback. One scan produces both metrics.
+void maintainStatsCache() {
+  if (displaySleeping ||
+      (currentPage != Page::TemperatureStats && currentPage != Page::HumidityStats)) return;
+  if (!sdAvailable || !isClockValid()) return;
+  const time_t now = time(nullptr);
+  // Bound rolling-window staleness even when no new sample can be logged.
+  if (statsCache.valid &&
+      (now < statsCache.calculatedAt || now - statsCache.calculatedAt >= 60)) {
+    statsCache.dirty = true;
+  }
+  if (statsCache.valid && !statsCache.dirty) return;
+  ++Perf::cacheMiss;
+  calculateStats(statsCache.temperature, statsCache.humidity);
+  statsCache.calculatedAt = now;
+  statsCache.valid = true;
+  statsCache.dirty = false;
+  ++Perf::cacheRefresh;
+  drawScreen();
 }
 
 void refreshDisplayIfDue(uint32_t now) {
@@ -1789,7 +1921,6 @@ void refreshDisplayIfDue(uint32_t now) {
     return;
   }
 
-  lastDisplayRefreshMs = now;
   drawScreen();
 }
 
@@ -2024,7 +2155,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (!displaySleeping) {
     drawScreen();
-    lastDisplayRefreshMs = millis();
   }
 }
 
@@ -2037,6 +2167,7 @@ void configureMQTT() {
 }
 
 bool connectMQTT() {
+  Perf::Scope timer(Perf::mqttConnect);
   Serial.printf("MQTT: connecting to %s:%u\n", MQTT_HOST, MQTT_PORT);
 
   bool connected = false;
@@ -2070,6 +2201,7 @@ void maintainMQTT(uint32_t now) {
   }
 
   if (mqttClient.connected()) {
+    Perf::Scope timer(Perf::mqttLoop);
     mqttClient.loop();
     return;
   }
@@ -2109,13 +2241,18 @@ void handleButtonALong() {
 }
 
 void handleButtonBShort() {
+  const uint32_t perfStart = micros();
+  Serial.printf("PERF B handler t=%lu\n", (unsigned long)millis());
   if (displaySleeping) {
+    Serial.println("PERF B wake_only");
     wakeDisplay();
+    Serial.printf("PERF B render_done elapsed_us=%lu\n", (unsigned long)(micros()-perfStart));
     return;
   }
 
   registerUserActivity();
 
+  Perf::bChanging = true;
   switch (currentPage) {
     case Page::Main:
       setCurrentPage(Page::Status);
@@ -2145,6 +2282,8 @@ void handleButtonBShort() {
   }
 
   drawScreen();
+  Perf::bChanging = false;
+  Serial.printf("PERF B render_done elapsed_us=%lu\n", (unsigned long)(micros()-perfStart));
 }
 
 void handleButtonBLong() {
@@ -2185,16 +2324,25 @@ void processButton(ButtonState& state,
                    void (*shortPressHandler)(),
                    void (*longPressHandler)()) {
   if (pressed && !state.wasPressed) {
+    if (&state == &buttonB) Serial.printf("PERF B press t=%lu page=%s\n", (unsigned long)millis(), Perf::pageName(currentPage));
     state.pressedAtMs = now;
     state.longPressHandled = false;
   }
 
   if (pressed && !state.longPressHandled && intervalElapsed(now, state.pressedAtMs, App::LONG_PRESS_MS)) {
     state.longPressHandled = true;
+    if (&state == &buttonB) {
+      Serial.printf("PERF B long t=%lu\n", (unsigned long)millis());
+      if (displaySleeping) Serial.println("PERF B wake_only");
+    }
     longPressHandler();
   }
 
+  if (!pressed && state.wasPressed && &state == &buttonB) {
+    Serial.printf("PERF B release t=%lu held_ms=%lu\n", (unsigned long)millis(), (unsigned long)(now-state.pressedAtMs));
+  }
   if (!pressed && state.wasPressed && !state.longPressHandled) {
+    if (&state == &buttonB) Serial.printf("PERF B short t=%lu\n", (unsigned long)millis());
     shortPressHandler();
   }
 
@@ -2347,15 +2495,19 @@ void setup() {
   configureWiFi();
 
   // Graph loading is guarded by SD/clock validity; retry on later redraws
-  // once NTP provides a valid clock. Statistics are loaded by drawScreen().
+  // once NTP provides a valid clock. Statistics are refreshed separately by maintainStatsCache().
   drawScreen();
   lastUserActivityMs = millis();
   lastDisplayRefreshMs = millis();
 }
 
 void loop() {
+  const uint32_t perfLoopStart = micros();
   const uint32_t now = millis();
 
+  const uint32_t perfUpdate = micros();
+  if (Perf::haveUpdate) Perf::gap.add(static_cast<uint32_t>(perfUpdate - Perf::lastUpdate));
+  Perf::lastUpdate = perfUpdate; Perf::haveUpdate = true;
   M5.update();
 
   processButtons(now);
@@ -2367,11 +2519,14 @@ void loop() {
   maintainLightFeedback(millis());
   maintainLightSound();
 
-  maintainDisplaySleep(now);
+  maintainDisplaySleep(millis());
   maintainImu(now);
 
-  refreshDisplayIfDue(now);
+  maintainStatsCache();
+  refreshDisplayIfDue(millis());
   logHealthIfDue(now);
 
   delay(2);
+  Perf::loop.add(static_cast<uint32_t>(micros()-perfLoopStart));
+  Perf::summary();  // Excluded from loop time, included in the real update gap.
 }
