@@ -1,6 +1,6 @@
 [English](README.md) | **日本語**
 
-# M5GO SwitchBot EnvMonitor — v0.6.1
+# M5GO SwitchBot EnvMonitor — v0.7.0
 
 M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジェクトです。Home Assistant が取得した SwitchBot の温湿度を MQTT broker 経由で受信し、現在値、SD 上の履歴・統計を表示します。内蔵 LED は環境異常のインジケーターとして使います。
 
@@ -35,7 +35,7 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 
 Charger Base は任意であり、ファームウェア動作の必須要件ではありません。常時運用には適切な電源が必要です。バッテリー持続時間は規定していません。
 
-以下は提示された対象環境です。リポジトリに依存バージョンの固定設定はありません。v0.6.1 はローカル導入済みの M5Stack ESP32 package 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、PubSubClient 2.8、ArduinoJson 7.4.3 でビルド成功しました（`m5stack:esp32:m5stack_core`、プレースホルダー設定）。指定の M5Unified 0.2.25／M5GFX 0.2.32 の組み合わせや実機動作を検証したものではありません。
+以下は提示された対象環境です。リポジトリに依存バージョンの固定設定はありません。v0.7.0 はローカル導入済みの M5Stack ESP32 package 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、PubSubClient 2.8、ArduinoJson 7.4.3 でビルド成功しました（`m5stack:esp32:m5stack_core`、プレースホルダー設定）。指定の M5Unified 0.2.25／M5GFX 0.2.32 の組み合わせや実機動作を検証したものではありません。
 
 | 依存ソフトウェア | バージョン／用途 |
 | --- | --- |
@@ -47,6 +47,8 @@ Charger Base は任意であり、ファームウェア動作の必須要件で�
 | ESP32 同梱 API | WiFi、Preferences、SD、SPI、time、heap 診断、RMT |
 
 外部 RGB LED ライブラリは不要です。
+
+SD 音声追加後の使用量：Flash 1,267,659 / 1,310,720 bytes（96%）、残り43,061 bytes。global RAM 84,580 / 327,680 bytes（25%）、残り243,100 bytes。音声追加前のローカル v0.7.0（Flash 1,239,739、RAM 59,804 bytes）から Flash +27,920、global RAM +24,776 bytesです。今回の音声追加は実機未検証です。
 
 ## 画面とボタン
 
@@ -67,7 +69,7 @@ B 短押しによる循環順序：
 | --- | --- | --- |
 | A | Display OFF | LCD 輝度を変更 |
 | B | 次のページ | 予約、操作時刻の更新のみ |
-| C | MAIN に戻る | Wi-Fi／MQTT を再接続 |
+| C | MAIN に戻る | 書斎シーリングライトの toggle コマンド送信 |
 
 短押しは離したとき、長押しは保持中に1回実行し、その後の短押し処理は抑制します。Display OFF 中は、どのボタンの短押し／長押しも現在のページのまま Wake するだけで、通常の操作は実行しません。短押しは離した時点、長押しは800 ms到達時点で Wake します。
 
@@ -94,6 +96,24 @@ Wi-Fi／MQTT は通常どおり再接続・subscribe し、retained MQTT から�
 
 SYSTEM STATUS と HEALTH のバッテリー表示は残量%のみです。運用済みログとの互換性のため、`/system` CSV は v0.6.0 の `battery_mv` 列を維持します。観測された0は電圧取得不可／無意味な値であり、バッテリーが空という意味ではありません。CSV 列や保存先は削除していません。
 
+## 書斎シーリングライト操作（v0.7.0）
+
+Display ON 中の C 長押し（800 ms）で、既存の MQTT 接続を使い `home/control/study/ceiling_light/toggle` へ payload `PRESS` を1回、**retain=false**、QoS 0 で publish します。設定済み Home Assistant Automation が `light.sirinkuraito` に `light.toggle` を実行します。HA 側の変更は不要です。C 短押しは引き続き MAIN。C 長押しの手動強制再接続は廃止し、自動 Wi-Fi／MQTT 再接続と backoff は維持します。
+
+既存の長押し latch により保持中は1回だけ実行し、離したときの短押しを抑制します。Display OFF 中の C 短押し／長押しは Wake のみです。一度離して改めて長押ししたときだけ送信します。コマンドのキュー保存・再試行・NVS 保存はしません。MQTT 未接続または publish が false を返した場合は Serial に失敗を出し、環境 LED をそのまま維持します。
+
+ローカル publish 成功時だけ、1灯が index 0〜9 を30 ms刻みで流れる約300 msの演出を開始します。Omarchy 風の落ち着いた blue/light blue/cyan/aqua/muted green で、RGB 値は `(4,6,8)`、`(6,7,9)`、`(6,9,10)`、`(6,9,8)`、`(7,8,6)`（既存強度12未満）です。LED ライブラリは追加しません。`millis()` 状態機械を loop から進め、演出用 delay はありません。ただし既存の同期 publish・SD・RMT 処理で実際の時間は延び得ます。RMT 送信自体は既存の同期 API／100 ms timeout を維持します。
+
+演出中は環境 LED を一時的に上書きします。MQTT の温湿度更新は継続し、終了後は最新の NORMAL/WARNING/CRITICAL を再判定して復帰します。RGB が使えなくてもコマンド送信は可能です。Serial は `LIGHT: toggle command published` または送信失敗を記録します。LED は**コマンド送信のフィードバックであり、照明の点灯／消灯を示しません**。M5GO は照明状態を管理せず、状態の購読や LCD レイアウト変更もありません。publish 成功は HA 実行や実際の照明動作の確認ではありません。
+
+### SD 効果音フィードバック（任意）
+
+照明コマンドの publish 成功後、既存 SD の `/sounds/light-toggle.wav` を M5Unified Speaker の `playRaw(int16_t*)` でストリーミング再生します。標準 RIFF/WAVE の signed 16-bit PCM、mono/stereo、8〜48 kHz に対応し、現在の約2.5秒・48 kHz stereo WAV は変換せず使用できます。WAV を Flash へ埋め込まず、Git へ追加せず、音声ライブラリも追加しません。適切な利用許諾のある WAV を配置してください。
+
+音量は `App::LIGHT_TOGGLE_SOUND_VOLUME = 48`（0〜255）。3個の8 KB PCM バッファを順に使い、Speaker の非同期再生が参照するデータを維持します。loop は2スロットのキューに空きがあるときだけ最大1チャンク（8 KB）を読み込み、音声全体の終了を待ちません。SD 読み込み自体は同期処理で、CSV・統計・通信処理が遅いと音切れが起こり得ます。音質・音量は実機確認が必要です。同じ SD インスタンスをメインループの音声読み込みとログ書き込みで共有し、SD 再初期化や CSV 変更はしません。
+
+LED は従来どおり約300 msで終了し、音と独立して環境表示へ戻ります。SD／ファイルなし、WAV 不正、Speaker 初期化／キュー投入失敗は AUDIO 警告を出すだけで、MQTT 成功と LED を妨げません。MQTT 失敗時や Display OFF の Wake では音を開始しません。再生中の再度の有効 C 長押しでは MQTT と LED は通常どおり実行し、音のみスキップして多重再生／再スタートしません。音はコマンド送信のフィードバックであり、実際の照明 ON/OFF や HA 実行確認ではありません。起動音は要求しません。圧縮／float／extensible WAV は拒否し、それらの場合のみ PCM 変換が必要です。指定の標準48 kHz WAV の変換は不要です。
+
 ## IMU ジェスチャー
 
 | 操作／設定 | 実装 |
@@ -108,7 +128,7 @@ SYSTEM STATUS と HEALTH のバッテリー表示は残量%のみです。運用
 
 水平判定は加速度 X（`ax`、必要なら符号反転）です。閾値は角度ではなく加速度成分です。方向が変われば HOLD を開始し直し、傾斜閾値未満に戻れば保留中の HOLD を取り消します。成立後は neutral に戻るまで latch で再操作を防止します。モーション Wake 後は HOLD を消去して latch を設定し、同じ動きで即座にページが変わるのを防ぎます。消灯後の最初のサンプルは加速度の基準値を設定します。IMU 初期化で加速度を取得できない場合はモーション機能を無効にし、ボタン操作は利用可能です。
 
-ユーザーによる実機確認済みの動作は、左 → TEMP / 24H、右 → HUM / 24H、モーション Wake です。今回の v0.6.1 更新では実機確認を繰り返していません。
+ユーザーによる実機確認済みの動作は、左 → TEMP / 24H、右 → HUM / 24H、モーション Wake です。今回の音声追加前に v0.7.0 の照明操作・RGB 演出もユーザーが実機確認済みです。これらの実機確認は今回繰り返していません。
 
 ## 環境閾値と RGB LED
 
@@ -132,6 +152,8 @@ LED は有効な MQTT 受信時に更新し、Display OFF とは独立してい�
 /
 ├── logs/
 │   └── YYYY-MM-DD.csv     # 環境履歴、従来の形式を維持
+├── sounds/
+│   └── light-toggle.wav   # 任意の効果音、別途配置
 └── system/
     └── YYYY-MM-DD.csv     # システム診断ブラックボックス
 ```
@@ -214,14 +236,14 @@ cp config.example.h config.h
 {"id":"switchbot-b3d8","temperature":24.9,"humidity":62.0}
 ```
 
-指定 topic だけを QoS 0 で購読して受理します。JSON の temperature/humidity は数値必須で、有限値かつ温度 −50〜80 °C、湿度0〜100%（境界を含む）を受理します。不正なメッセージでは値も受信時刻も更新しません。`id` は検証せず必須でもありません。測定時刻も読みません。クライアントバッファは512 bytes。`WiFiClient` を使い TLS は実装せず、温湿度を受信するだけで publish はしません。
+指定 topic だけを QoS 0 で購読して受理します。JSON の temperature/humidity は数値必須で、有限値かつ温度 −50〜80 °C、湿度0〜100%（境界を含む）を受理します。不正なメッセージでは値も受信時刻も更新しません。`id` は検証せず必須でもありません。測定時刻も読みません。クライアントバッファは512 bytes。`WiFiClient` を使い TLS は実装せず、温湿度を受信し、上記の照明操作コマンドだけを publish します。
 
 [Home Assistant 例](home-assistant/switchbot-b3d8-mqtt.yaml) は、どちらかの値の変化、HA 起動、毎分で実行し、2秒 delay と基本的な unavailable 状態フィルターを経て retain=true、QoS 0 で配信します。`sensor.meter_b3d8_temperature` / `sensor.meter_b3d8_humidity` は環境に合わせて変更してください。古い retained message も新しく受信したものとして扱います。data age は配信経路の鮮度であり、センサーの測定時刻からの経過時間ではありません。
 
 | 通信／堅牢性 | 実装 |
 | --- | --- |
 | Wi-Fi | STA、persistent off、auto reconnect on、Wi-Fi sleep off |
-| Wi-Fi retry | 初回／手動接続待ち15秒。再試行待ち5 → 10 → 20 → 40 → 60秒、上限60秒、接続でリセット |
+| Wi-Fi retry | 初回接続待ち15秒。再試行待ち5 → 10 → 20 → 40 → 60秒、上限60秒、接続でリセット |
 | MQTT retry | Wi-Fi 接続時のみ。失敗後の待ち2 → 4 → 8 → 16 → 32 → 60秒、上限60秒、接続＋購読成功でリセット |
 | MQTT 接続 | keepalive 30秒、socket timeout 5秒、購読失敗で切断、Wi-Fi 未接続時は MQTT 切断 |
 | データ鮮度 | 初回有効受信前 WAIT、180秒未満 LIVE、180〜600秒未満 STALE、600秒以上 OFFLINE |
@@ -229,7 +251,7 @@ cp config.example.h config.h
 | Serial 診断 | 115200 baud、起動時 reset reason／heap、通信・エラー、5分ごと HEALTH |
 | HEALTH | uptime、Wi-Fi/MQTT、RSSI、free/minimum/largest heap、data state/age、SD/IMU、battery、環境状態 |
 
-再試行はメインループの期限判定と exponential backoff で制御します。MQTT connect/socket 操作や SD 読み書きは同期処理であり、UI の無停止応答を保証するものではありません。heap は監視しますが、heap を理由とする自動再起動はありません。canvas 確保失敗は fatal で setup を停止します。SD/IMU/RGB 初期化失敗は個別に処理します。今回の v0.6.1 更新では実機／耐久運転試験を行っていません。
+再試行はメインループの期限判定と exponential backoff で制御します。MQTT connect/socket 操作や SD 読み書きは同期処理であり、UI の無停止応答を保証するものではありません。heap は監視しますが、heap を理由とする自動再起動はありません。canvas 確保失敗は fatal で setup を停止します。SD/IMU/RGB 初期化失敗は個別に処理します。今回の v0.7.0 更新では実機／耐久運転試験を行っていません。
 
 ## リポジトリとフォント
 

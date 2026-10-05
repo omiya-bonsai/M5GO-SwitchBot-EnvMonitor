@@ -28,7 +28,7 @@
 
 namespace App {
 constexpr char NAME[] = "M5GO-SwitchBot-EnvMonitor";
-constexpr char VERSION[] = "0.6.1";
+constexpr char VERSION[] = "0.7.0";
 
 constexpr int SCREEN_WIDTH = 320;
 constexpr int SCREEN_HEIGHT = 240;
@@ -43,6 +43,14 @@ constexpr uint32_t WIFI_RETRY_MAX_MS = 60UL * 1000UL;
 
 constexpr uint32_t MQTT_RETRY_MIN_MS = 2UL * 1000UL;
 constexpr uint32_t MQTT_RETRY_MAX_MS = 60UL * 1000UL;
+constexpr char MQTT_TOPIC_STUDY_LIGHT_TOGGLE[] =
+  "home/control/study/ceiling_light/toggle";
+constexpr char MQTT_LIGHT_PAYLOAD[] = "PRESS";
+constexpr uint32_t LIGHT_LED_FRAME_MS = 30UL;
+constexpr char LIGHT_TOGGLE_SOUND_PATH[] = "/sounds/light-toggle.wav";
+constexpr uint8_t LIGHT_TOGGLE_SOUND_VOLUME = 48;  // M5Unified range: 0..255
+constexpr uint8_t LIGHT_SOUND_CHANNEL = 0;
+constexpr size_t LIGHT_SOUND_BUFFER_BYTES = 8192;
 constexpr uint16_t MQTT_KEEPALIVE_SEC = 30;
 constexpr uint16_t MQTT_SOCKET_TIMEOUT_SEC = 5;
 
@@ -211,6 +219,9 @@ bool timeReadyLogged = false;
 bool sdAvailable = false;
 bool imuAvailable = false;
 bool rgbAvailable = false;
+bool lightFeedbackActive = false;
+uint32_t lightFeedbackStartedMs = 0;
+uint8_t lightFeedbackFrame = 255;
 
 uint8_t brightnessIndex = App::DEFAULT_BRIGHTNESS_INDEX;
 
@@ -517,6 +528,8 @@ void clearRgbLeds() {
 }
 
 void updateEnvironmentLeds() {
+  // MQTT may update sensorData during feedback; restore the latest state later.
+  if (lightFeedbackActive) return;
 
   if (!rgbAvailable) {
     return;
@@ -575,6 +588,171 @@ void updateEnvironmentLeds() {
     Serial.println(
       "RGB: transmit failed");
   }
+}
+
+// SD PCM streaming: three buffers keep queued data alive until consumed.
+File lightSoundFile;
+int16_t lightSoundBuffers[3][App::LIGHT_SOUND_BUFFER_BYTES / 2];
+bool lightSoundActive = false;
+uint32_t lightSoundRemaining = 0;
+uint32_t lightSoundRate = 0;
+bool lightSoundStereo = false;
+uint8_t lightSoundBufferIndex = 0;
+
+uint32_t wavLe32(const uint8_t* p) {
+  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+         (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+}
+
+bool readLightSoundHeader() {
+  uint8_t header[16];
+  const uint32_t fileSize = lightSoundFile.size();
+  if (lightSoundFile.read(header, 12) != 12 ||
+      memcmp(header, "RIFF", 4) || memcmp(header + 8, "WAVE", 4)) return false;
+  const uint32_t riffSize = wavLe32(header + 4);
+  if (riffSize < 4 || riffSize > fileSize - 8) return false;
+  const uint32_t end = riffSize + 8;
+  bool formatReady = false;
+  // Bounded scan of RIFF chunks; no decoder or whole-file allocation.
+  for (unsigned chunks = 0; chunks < 64; ++chunks) {
+    const uint32_t position = lightSoundFile.position();
+    if (position > end || end - position < 8 ||
+        lightSoundFile.read(header, 8) != 8) return false;
+    const uint32_t length = wavLe32(header + 4);
+    const uint32_t dataStart = position + 8;
+    if (length > end - dataStart) return false;
+    const bool isFormat = !memcmp(header, "fmt ", 4);
+    const bool isData = !memcmp(header, "data", 4);
+    if (isFormat) {
+      if (length < 16 || lightSoundFile.read(header, 16) != 16) return false;
+      const uint16_t channels = header[2] | (uint16_t(header[3]) << 8);
+      const uint16_t alignment = header[12] | (uint16_t(header[13]) << 8);
+      lightSoundRate = wavLe32(header + 4);
+      if (header[0] != 1 || header[1] != 0 ||
+          (channels != 1 && channels != 2) || header[14] != 16 || header[15] != 0 ||
+          alignment != channels * 2 || lightSoundRate < 8000 || lightSoundRate > 48000 ||
+          wavLe32(header + 8) != lightSoundRate * alignment) return false;
+      lightSoundStereo = channels == 2;
+      formatReady = true;
+    } else if (isData) {
+      if (!formatReady || length == 0 || length % (lightSoundStereo ? 4 : 2)) return false;
+      lightSoundRemaining = length;
+      return true;  // File position now points to PCM, not RIFF metadata.
+    }
+    const uint32_t padding = length & 1;
+    if (padding > end - dataStart - length ||
+        !lightSoundFile.seek(dataStart + length + padding)) return false;
+  }
+  return false;
+}
+
+void maintainLightSound() {
+  if (!lightSoundActive) return;
+  const size_t queued = M5.Speaker.isPlaying(App::LIGHT_SOUND_CHANNEL);
+  if (lightSoundRemaining == 0) {
+    if (queued == 0) lightSoundActive = false;
+    return;
+  }
+  if (queued >= 2) return;  // Never wait for a Speaker queue slot.
+
+  const size_t bytes = lightSoundRemaining < App::LIGHT_SOUND_BUFFER_BYTES
+    ? lightSoundRemaining : App::LIGHT_SOUND_BUFFER_BYTES;
+  int16_t* buffer = lightSoundBuffers[lightSoundBufferIndex];
+  if (lightSoundFile.read(reinterpret_cast<uint8_t*>(buffer), bytes) != bytes ||
+      !M5.Speaker.isRunning() ||
+      !M5.Speaker.playRaw(buffer, bytes / sizeof(int16_t), lightSoundRate,
+                          lightSoundStereo, 1, App::LIGHT_SOUND_CHANNEL, false)) {
+    Serial.println("AUDIO: playback failed");
+    lightSoundFile.close();
+    lightSoundRemaining = 0;
+    // Drain existing queued buffers before allowing a new sound to reuse RAM.
+    return;
+  }
+  lightSoundBufferIndex = (lightSoundBufferIndex + 1) % 3;
+  lightSoundRemaining -= bytes;
+  if (lightSoundRemaining == 0) lightSoundFile.close();
+}
+
+void startLightSound() {
+  if (lightSoundActive || M5.Speaker.isPlaying(App::LIGHT_SOUND_CHANNEL)) {
+    Serial.println("AUDIO: busy - feedback skipped");
+    return;
+  }
+  if (!sdAvailable) {
+    Serial.println("AUDIO: SD unavailable");
+    return;
+  }
+  lightSoundFile = SD.open(App::LIGHT_TOGGLE_SOUND_PATH, FILE_READ);
+  if (!lightSoundFile) {
+    Serial.printf("AUDIO: cannot open %s\n", App::LIGHT_TOGGLE_SOUND_PATH);
+    return;
+  }
+  if (!readLightSoundHeader()) {
+    Serial.println("AUDIO: unsupported or invalid WAV (16-bit PCM mono/stereo required)");
+    lightSoundFile.close();
+    return;
+  }
+  if (!M5.Speaker.begin()) {
+    Serial.println("AUDIO: speaker initialization failed");
+    lightSoundFile.close();
+    return;
+  }
+  M5.Speaker.setVolume(App::LIGHT_TOGGLE_SOUND_VOLUME);
+  lightSoundBufferIndex = 0;
+  lightSoundActive = true;
+  maintainLightSound();  // Queue the first chunk, not the full 2.5 seconds.
+  if (lightSoundRemaining || M5.Speaker.isPlaying(App::LIGHT_SOUND_CHANNEL)) {
+    Serial.printf("AUDIO: playing %s\n", App::LIGHT_TOGGLE_SOUND_PATH);
+  }
+}
+
+// One subdued moving LED, blue -> cyan -> aqua -> muted green.
+// Scaled from the requested palette to the existing channel intensity 12.
+void maintainLightFeedback(uint32_t now) {
+  if (!lightFeedbackActive) return;
+
+  const uint32_t frame =
+    static_cast<uint32_t>(now - lightFeedbackStartedMs) / App::LIGHT_LED_FRAME_MS;
+  if (frame >= App::RGB_LED_COUNT) {
+    lightFeedbackActive = false;
+    updateEnvironmentLeds();
+    return;
+  }
+  if (frame == lightFeedbackFrame) return;
+  lightFeedbackFrame = static_cast<uint8_t>(frame);
+
+  constexpr uint32_t palette[] = {
+    0x040608, 0x060709, 0x06090A, 0x060908, 0x070806
+  };
+  for (size_t i = 0; i < App::RGB_LED_COUNT; ++i) rgbLedColors[i] = 0;
+  setRgbLed(frame, palette[frame * 4 / (App::RGB_LED_COUNT - 1)]);
+  if (!transmitRgbLeds()) {
+    Serial.println("RGB: light feedback transmit failed");
+    lightFeedbackActive = false;
+    updateEnvironmentLeds();
+  }
+}
+
+void publishStudyLightToggle() {
+  if (!mqttClient.connected()) {
+    Serial.println("LIGHT: publish failed - MQTT disconnected");
+    return;
+  }
+  if (!mqttClient.publish(App::MQTT_TOPIC_STUDY_LIGHT_TOGGLE,
+                          App::MQTT_LIGHT_PAYLOAD, false)) {
+    Serial.println("LIGHT: publish failed");
+    return;
+  }
+
+  // PubSubClient success is a local send result, not light-state confirmation.
+  Serial.println("LIGHT: toggle command published");
+  if (rgbAvailable) {
+    lightFeedbackStartedMs = millis();
+    lightFeedbackFrame = 255;
+    lightFeedbackActive = true;
+    maintainLightFeedback(lightFeedbackStartedMs);
+  }
+  startLightSound();
 }
 
 void initializeRgbLeds() {
@@ -1906,21 +2084,6 @@ void maintainMQTT(uint32_t now) {
   scheduleRetry(mqttRetry, now, App::MQTT_RETRY_MAX_MS);
 }
 
-void forceNetworkReconnect() {
-  Serial.println("Network: manual reconnect");
-
-  mqttClient.disconnect();
-  WiFi.disconnect(false, false);
-
-  resetRetry(wifiRetry, App::WIFI_RETRY_MIN_MS);
-  resetRetry(mqttRetry, App::MQTT_RETRY_MIN_MS);
-
-  startWiFiConnection();
-
-  wifiRetry.nextAttemptMs =
-    millis() + App::WIFI_CONNECT_TIMEOUT_MS;
-}
-
 // =============================================================================
 // Buttons
 // =============================================================================
@@ -2012,7 +2175,7 @@ void handleButtonCLong() {
   }
 
   registerUserActivity();
-  forceNetworkReconnect();
+  publishStudyLightToggle();
   drawScreen();
 }
 
@@ -2165,6 +2328,7 @@ void setup() {
   auto config = M5.config();
 
   config.internal_imu = true;
+  config.internal_spk = true;
 
   M5.begin(config);
 
@@ -2200,6 +2364,8 @@ void loop() {
   maintainTime();
   maintainMQTT(now);
   maintainSdLogging(now);
+  maintainLightFeedback(millis());
+  maintainLightSound();
 
   maintainDisplaySleep(now);
   maintainImu(now);

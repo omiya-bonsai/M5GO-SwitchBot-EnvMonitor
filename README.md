@@ -1,6 +1,6 @@
 **English** | [日本語](README.ja.md)
 
-# M5GO SwitchBot EnvMonitor — v0.6.1
+# M5GO SwitchBot EnvMonitor — v0.7.0
 
 An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant obtains SwitchBot temperature/humidity measurements and publishes them through an MQTT broker to the M5GO. The device displays current values, SD-backed history and statistics, and uses its built-in LEDs to indicate environmental warnings.
 
@@ -35,7 +35,7 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 
 A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
 
-The following is the supplied target environment. The repository does not pin dependency versions. v0.6.1 also compiled successfully with the locally installed M5Stack ESP32 package 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28, PubSubClient 2.8 and ArduinoJson 7.4.3 (`m5stack:esp32:m5stack_core`, placeholder configuration). This does not verify the exact M5Unified 0.2.25 / M5GFX 0.2.32 combination or device behavior.
+The following is the supplied target environment. The repository does not pin dependency versions. v0.7.0 compiled successfully with the locally installed M5Stack ESP32 package 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28, PubSubClient 2.8 and ArduinoJson 7.4.3 (`m5stack:esp32:m5stack_core`, placeholder configuration). This does not verify the exact M5Unified 0.2.25 / M5GFX 0.2.32 combination or device behavior.
 
 | Dependency | Version / use |
 | --- | --- |
@@ -47,6 +47,8 @@ The following is the supplied target environment. The repository does not pin de
 | ESP32 bundled APIs | WiFi, Preferences, SD, SPI, time, heap diagnostics, RMT |
 
 No external RGB LED library is required.
+
+Build size with SD audio feedback: Flash 1,267,659 / 1,310,720 bytes (96%), leaving 43,061 bytes; global RAM 84,580 / 327,680 bytes (25%), leaving 243,100 bytes. Compared with the local v0.7.0 build before audio (1,239,739 bytes / 59,804 bytes RAM), Flash increased by 27,920 bytes and global RAM by 24,776 bytes. Device audio behavior has not been tested in this update.
 
 ## Screens and buttons
 
@@ -67,7 +69,7 @@ B short press cycles:
 | --- | --- | --- |
 | A | Display OFF | Cycle LCD brightness |
 | B | Next page | Reserved; registers activity only |
-| C | Return to MAIN | Reconnect Wi-Fi and MQTT |
+| C | Return to MAIN | Publish study ceiling-light toggle command |
 
 Short actions occur on release; long actions occur once while held and suppress the short action. While Display OFF, any short or long button action only wakes the display, keeping the current page; its normal action is consumed. Wake occurs at release for a short press or at 800 ms for a long press.
 
@@ -94,6 +96,24 @@ Wi-Fi and MQTT reconnect normally, subscribe, and reacquire environmental values
 
 SYSTEM STATUS and HEALTH show battery percentage only. The v0.6.0 `/system` CSV schema retains `battery_mv` for compatibility with deployed logs; its observed 0 is an unavailable/useless reading, not proof of an empty battery. No CSV columns or paths were removed.
 
+## Study ceiling-light command (v0.7.0)
+
+While Display ON, C long press (800 ms) publishes once to `home/control/study/ceiling_light/toggle`, payload `PRESS`, **retain=false**, using the existing MQTT connection (QoS 0). The already configured Home Assistant automation calls `light.toggle` for `light.sirinkuraito`; no HA changes are needed. C short press still returns to MAIN. C-long manual network reconnect was removed; automatic Wi-Fi/MQTT reconnect and backoff remain.
+
+The existing long-press latch runs the action once per hold and suppresses the short action on release. While Display OFF, C short/long only wakes the display; release and press again for a toggle. Commands are not queued, retried or saved in NVS. When MQTT is disconnected or publish returns false, Serial reports failure and the environmental LEDs remain unchanged.
+
+Only a successful local publish starts feedback: one LED moves from index 0 to 9 at 30 ms per step (approximately 300 ms total), using subdued Omarchy-inspired blue/light blue/cyan/aqua/muted green. RGB values are `(4,6,8)`, `(6,7,9)`, `(6,9,10)`, `(6,9,8)`, `(7,8,6)` (channels below the existing intensity 12). No extra LED library is used. The `millis()` state machine advances from the loop without animation delays; existing synchronous publish, SD and RMT calls can extend the observed duration. RMT transmission itself retains its existing synchronous API/100 ms timeout.
+
+Feedback temporarily overrides the environmental LEDs. MQTT measurements continue updating during it; after completion, the latest NORMAL/WARNING/CRITICAL state is recomputed and restored. RGB failure does not prevent command publication. Serial logs `LIGHT: toggle command published` or a publish failure. The LEDs indicate a command sent, **not that the light turned on/off**: the M5GO does not track light state, subscribe to state feedback, or change the LCD layout. Publish success does not confirm HA execution or actual light operation.
+
+### Optional SD sound feedback
+
+After successful light-command publish, `/sounds/light-toggle.wav` is streamed from the existing SD card using M5Unified Speaker `playRaw(int16_t*)`. Standard RIFF/WAVE signed 16-bit PCM, mono/stereo, 8–48 kHz is supported; the current approximately 2.5-second 48 kHz stereo file can be used unchanged. No WAV data is embedded or added to Git, and no audio library is added. Place a properly licensed WAV at that path.
+
+Volume is `App::LIGHT_TOGGLE_SOUND_VOLUME = 48` (0–255). Three 8 KB PCM buffers keep asynchronous Speaker requests alive. The loop reads at most one 8 KB chunk when its two-slot channel queue has room, without waiting for the complete sound. SD reads remain synchronous, and slow CSV/statistics/network work can cause audio gaps; playback quality and volume require device testing. The same SD instance is shared by reads and log writes in the main loop; SD is not reinitialized and CSV schemas remain unchanged.
+
+LED feedback still ends after approximately 300 ms and restores environmental LEDs independently of sound. Missing SD/file, invalid WAV, Speaker initialization or queue failure logs an AUDIO warning and does not undo or prevent MQTT/LED success. MQTT failure and Display OFF wake start no sound. A second valid C-long still sends MQTT and restarts LED feedback; sound already active is skipped rather than layered or restarted. Sound means command publication, not actual light ON/OFF or HA confirmation. No boot sound is requested. Compressed/float/extensible WAV is rejected; PCM conversion is needed only for unsupported formats, not the supplied standard 48 kHz file.
+
 ## IMU gestures
 
 | Gesture / setting | Implementation |
@@ -108,7 +128,7 @@ SYSTEM STATUS and HEALTH show battery percentage only. The v0.6.0 `/system` CSV 
 
 Horizontal acceleration is accelerometer X (`ax`), optionally inverted; thresholds are acceleration components, not angles. A direction change starts a new hold; dropping below the tilt threshold cancels the pending hold. After an action, the latch prevents repeated switching until neutral is observed. Motion wake clears the hold and sets the latch, so the same movement cannot immediately switch pages. The first sample after display shutoff establishes the magnitude baseline. An unavailable IMU disables motion features while leaving buttons usable.
 
-User-reported device checks confirm left → TEMP / 24H, right → HUM / 24H and motion wake. These checks were not repeated during this v0.6.1 update.
+User-reported device checks confirm left → TEMP / 24H, right → HUM / 24H and motion wake. The user also confirmed v0.7.0 light operation and RGB feedback before this audio update; these device checks were not repeated here.
 
 ## Environmental thresholds and RGB LEDs
 
@@ -132,6 +152,8 @@ LEDs update on valid MQTT receipt and remain independent of Display OFF. The sta
 /
 ├── logs/
 │   └── YYYY-MM-DD.csv     # environment history; compatible schema
+├── sounds/
+│   └── light-toggle.wav   # optional sound; supplied separately
 └── system/
     └── YYYY-MM-DD.csv     # system diagnostic black box
 ```
@@ -214,14 +236,14 @@ Keep `config.h` ignored and never publish SSIDs, Wi-Fi/MQTT passwords or other c
 {"id":"switchbot-b3d8","temperature":24.9,"humidity":62.0}
 ```
 
-Only the configured topic is accepted, subscribed at QoS 0. JSON must have numeric temperature and humidity; finite temperature −50…80 °C and humidity 0…100% are accepted, inclusive. Invalid messages do not update values or receipt time. `id` is not validated or required; no measurement timestamp is consumed. The client buffer is 512 bytes. The firmware uses `WiFiClient` (no TLS), receives measurements and does not publish them.
+Only the configured topic is accepted, subscribed at QoS 0. JSON must have numeric temperature and humidity; finite temperature −50…80 °C and humidity 0…100% are accepted, inclusive. Invalid messages do not update values or receipt time. `id` is not validated or required; no measurement timestamp is consumed. The client buffer is 512 bytes. The firmware uses `WiFiClient` (no TLS), receives measurements and publishes only the light-control command described above.
 
 [Home Assistant example](home-assistant/switchbot-b3d8-mqtt.yaml) publishes on either entity's state change, Home Assistant startup and every minute, with a two-second delay, basic unavailable-state filtering, retain=true and QoS 0. Adapt the `sensor.meter_b3d8_temperature` / `sensor.meter_b3d8_humidity` entities locally. A retained old message is treated as newly received; data age measures the delivery path, not the underlying sensor measurement age.
 
 | Network / reliability item | Implementation |
 | --- | --- |
 | Wi-Fi | STA; persistent configuration off, auto reconnect on, Wi-Fi sleep off |
-| Wi-Fi retry | Initial/manual connection wait 15 s; retry delays 5 → 10 → 20 → 40 → 60 s, capped; reset on connection |
+| Wi-Fi retry | Initial connection wait 15 s; retry delays 5 → 10 → 20 → 40 → 60 s, capped; reset on connection |
 | MQTT retry | Only with Wi-Fi connected; failed attempts delayed 2 → 4 → 8 → 16 → 32 → 60 s, capped; reset on successful connect + subscribe |
 | MQTT connection | Keepalive 30 s; socket timeout 5 s; subscribe failure disconnects; Wi-Fi loss disconnects MQTT |
 | Freshness | WAIT before first valid message; LIVE <180 s; STALE 180–<600 s; OFFLINE ≥600 s |
@@ -229,7 +251,7 @@ Only the configured topic is accepted, subscribed at QoS 0. JSON must have numer
 | Serial diagnostics | 115200 baud; boot reset reason and heap; network/error messages; HEALTH every 5 min |
 | HEALTH | Uptime, Wi-Fi/MQTT, RSSI, free/minimum/largest heap, data state/age, SD/IMU, battery, environment state |
 
-Retries use deadline checks and exponential backoff in the main loop. MQTT connect/socket operations and SD reads/writes are synchronous; this is not a guarantee of uninterrupted UI response. Heap is observed, with no automatic heap-triggered restart. Canvas allocation failure is fatal and stops setup; SD/IMU/RGB initialization failures are handled separately. No device/endurance test was performed for this v0.6.1 update.
+Retries use deadline checks and exponential backoff in the main loop. MQTT connect/socket operations and SD reads/writes are synchronous; this is not a guarantee of uninterrupted UI response. Heap is observed, with no automatic heap-triggered restart. Canvas allocation failure is fatal and stops setup; SD/IMU/RGB initialization failures are handled separately. No device/endurance test was performed for this v0.7.0 update.
 
 ## Repository and fonts
 
