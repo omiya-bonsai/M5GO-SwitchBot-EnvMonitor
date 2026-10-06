@@ -4,6 +4,8 @@
 
 M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジェクトです。Home Assistant が取得した SwitchBot の温湿度を MQTT broker 経由で受信し、現在値、SD 上の履歴・統計を表示します。内蔵 LED は環境異常のインジケーターとして使います。
 
+![センサーを接続した M5GO SwitchBot EnvMonitor](assets/readme-collage.jpg)
+
 ## 機能と構成
 
 `SwitchBot → Home Assistant → MQTT broker（Mosquitto 等）→ M5GO`

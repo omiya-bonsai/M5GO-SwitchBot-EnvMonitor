@@ -4,6 +4,8 @@
 
 An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant obtains SwitchBot temperature/humidity measurements and publishes them through an MQTT broker to the M5GO. The device displays current values, SD-backed history and statistics, and uses its built-in LEDs to indicate environmental warnings.
 
+![M5GO SwitchBot EnvMonitor with its sensors](assets/readme-collage.jpg)
+
 ## Features and architecture
 
 `SwitchBot → Home Assistant → MQTT broker (e.g. Mosquitto) → M5GO`
