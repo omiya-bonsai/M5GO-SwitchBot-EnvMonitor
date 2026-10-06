@@ -1097,7 +1097,6 @@ uint32_t keyRawChangedMs = 0;
 
 void initializeKeyUnit() {
   // GPIO36 is input-only and has no internal pull-up. Unit Key supplies its own.
-  // GPIO26 (the Unit's SK6812 input) is intentionally untouched.
   pinMode(App::KEY_INPUT_PIN, INPUT);
   keyRawPressed = digitalRead(App::KEY_INPUT_PIN) == LOW;
   keyStablePressed = keyRawPressed;
@@ -1119,6 +1118,74 @@ void maintainKeyUnit() {
   Serial.printf("PERF KEY action t=%lu\n", (unsigned long)now);
   // Dedicated light key: do not wake the display or update its activity timer.
   publishStudyLightToggle();
+}
+
+// Independent 1-pixel RMT channel; static frame remains untouched until TX completes.
+constexpr int KEY_LED_PIN = 26;
+constexpr uint8_t KEY_LED_MIN_BRIGHTNESS = 8, KEY_LED_MAX_BRIGHTNESS = 51;  // 8/255 to 51/255.
+constexpr uint8_t KEY_LED_RED = 255, KEY_LED_GREEN = 100, KEY_LED_BLUE = 20;
+constexpr uint32_t KEY_LED_UPDATE_MS = 30;
+// Three smooth periodic components; amplitudes sum to 21.5 around 29.5.
+constexpr uint32_t KEY_LED_PERIOD_MS[] = {17311, 7103, 2909};
+uint32_t keyLedPhaseMs[] = {17311 / 2, 7103 * 3 / 5, 2909 * 2 / 5};
+rmt_data_t keyLedFrame[25];  // 24 GRB bits + >=80us LOW latch.
+bool keyLedReady = false;
+uint32_t keyLedUpdatedMs = 0;
+uint32_t keyLedLastColor = 0xFFFFFFFF;
+
+int32_t keyLedWave(uint32_t phase, uint32_t period) {
+  // Smooth triangle, Q10: continuous value and slope at both turning points.
+  const uint32_t cycle = phase * 2048 / period;
+  const uint32_t t = cycle <= 1024 ? cycle : 2048 - cycle;
+  const uint32_t smooth = (t * t / 1024) * (3072 - 2 * t) / 1024;
+  return 1024 - int32_t(2 * smooth);
+}
+uint32_t keyLedBrightness() {
+  const int32_t sum = 30 * keyLedWave(keyLedPhaseMs[0], KEY_LED_PERIOD_MS[0]) +
+    10 * keyLedWave(keyLedPhaseMs[1], KEY_LED_PERIOD_MS[1]) +
+    3 * keyLedWave(keyLedPhaseMs[2], KEY_LED_PERIOD_MS[2]);
+  return uint32_t(29 * 1024 + 512 + sum / 2 + 512) / 1024;
+}
+bool sendKeyLed(uint32_t brightness) {
+  const uint8_t grb[] = {
+    uint8_t(KEY_LED_GREEN * brightness / 255),
+    uint8_t(KEY_LED_RED * brightness / 255),
+    uint8_t(KEY_LED_BLUE * brightness / 255)
+  };
+  const uint32_t color = (uint32_t(grb[0]) << 16) | (uint32_t(grb[1]) << 8) | grb[2];
+  if (color == keyLedLastColor) return true;
+  size_t i = 0;
+  for (uint8_t value : grb) {
+    for (int bit = 7; bit >= 0; --bit) encodeRgbBit(keyLedFrame[i++], value & (1U << bit));
+  }
+  keyLedFrame[24].val = 0;
+  keyLedFrame[24].duration0 = 800;
+  keyLedFrame[24].duration1 = 1;
+  if (!rmtWriteAsync(KEY_LED_PIN, keyLedFrame, 25)) return false;
+  keyLedLastColor = color;
+  return true;
+}
+void initializeKeyLed() {
+  pinMode(KEY_LED_PIN, OUTPUT);
+  digitalWrite(KEY_LED_PIN, LOW);
+  keyLedReady = rmtInit(KEY_LED_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 10000000);
+  if (keyLedReady) {
+    keyLedUpdatedMs = millis();
+    keyLedReady = sendKeyLed(keyLedBrightness());
+  }
+  Serial.println(keyLedReady ? "KEY LED: initialized" : "KEY LED: initialization failed");
+}
+void maintainKeyLed() {
+  const uint32_t now = millis();
+  if (!keyLedReady || uint32_t(now - keyLedUpdatedMs) < KEY_LED_UPDATE_MS ||
+      !rmtTransmitCompleted(KEY_LED_PIN)) return;
+  const uint32_t elapsed = uint32_t(now - keyLedUpdatedMs);  // Safe across millis wrap.
+  keyLedUpdatedMs = now;
+  for (size_t i = 0; i < 3; ++i) {
+    keyLedPhaseMs[i] = (keyLedPhaseMs[i] + elapsed % KEY_LED_PERIOD_MS[i]) % KEY_LED_PERIOD_MS[i];
+  }
+  const uint32_t brightness = keyLedBrightness();
+  if (!sendKeyLed(brightness)) keyLedReady = false;  // Button remains independent.
 }
 #endif  // KEY_UNIT_ENABLED
 
@@ -2855,6 +2922,7 @@ void setup() {
   initializePortAUnits();
 #if KEY_UNIT_ENABLED
   initializeKeyUnit();
+  initializeKeyLed();
 #endif
   configureMQTT();
   configureWiFi();
@@ -2878,6 +2946,7 @@ void loop() {
   processButtons(now);
 #if KEY_UNIT_ENABLED
   maintainKeyUnit();
+  maintainKeyLed();
 #endif
   maintainPortAUnits();
 
