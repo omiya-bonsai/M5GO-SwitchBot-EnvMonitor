@@ -330,4 +330,8 @@ Retries use deadline checks and exponential backoff in the main loop. MQTT conne
 
 Open the sketch in Arduino IDE with the M5GO-compatible ESP32 board selected and the dependencies installed. Generated font headers are already present; font regeneration is optional. No LittleFS font upload is used. All three headers must be available to select JetBrains Mono; otherwise the sketch uses M5GFX FreeMono fonts.
 
-JetBrains Mono is under SIL OFL 1.1; see [font notice](FONT-NOTICE.md) and [OFL](OFL-JetBrainsMono.txt). The repository's `LICENSE` is currently empty, so an application license is not specified.
+JetBrains Mono is under SIL OFL 1.1; see [font notice](FONT-NOTICE.md) and [OFL](OFL-JetBrainsMono.txt).
+
+## License
+
+The application code in this repository is licensed under the MIT License. Copyright (c) 2026 omiya-bonsai. See [LICENSE](LICENSE).

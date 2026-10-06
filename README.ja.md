@@ -330,4 +330,8 @@ cp config.example.h config.h
 
 Arduino IDE でスケッチを開き、M5GO 対応の ESP32 ボードを選び、依存ライブラリを導入してください。生成済みフォントヘッダーは同梱されており、再生成は任意です。LittleFS フォント upload は使用しません。3つのヘッダーがすべてあれば JetBrains Mono、なければ M5GFX の FreeMono を使用します。
 
-JetBrains Mono は SIL OFL 1.1 です。[フォント注記](FONT-NOTICE.md) と [OFL](OFL-JetBrainsMono.txt) を参照してください。現在の `LICENSE` は空で、アプリケーション本体のライセンスは指定されていません。
+JetBrains Mono は SIL OFL 1.1 です。[フォント注記](FONT-NOTICE.md) と [OFL](OFL-JetBrainsMono.txt) を参照してください。
+
+## ライセンス
+
+このリポジトリのアプリケーションコードは MIT License でライセンスされています。Copyright (c) 2026 omiya-bonsai。[LICENSE](LICENSE) を参照してください。
