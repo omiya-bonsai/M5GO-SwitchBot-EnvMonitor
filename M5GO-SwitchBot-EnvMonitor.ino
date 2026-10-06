@@ -46,7 +46,9 @@ constexpr uint32_t CONTEXT_HEARTBEAT_MS = 60000, CONTEXT_PUBLISH_MIN_MS = 1000;
 constexpr int SCREEN_WIDTH = 320;
 constexpr int SCREEN_HEIGHT = 240;
 
-constexpr uint32_t DISPLAY_SLEEP_MS = 3UL * 60UL * 1000UL;
+static_assert(DISPLAY_SLEEP_TIMEOUT_SEC >= 0 && uint64_t(DISPLAY_SLEEP_TIMEOUT_SEC) <= UINT32_MAX / 1000UL,
+              "DISPLAY_SLEEP_TIMEOUT_SEC must fit in uint32_t milliseconds");
+constexpr uint32_t DISPLAY_SLEEP_MS = uint32_t(DISPLAY_SLEEP_TIMEOUT_SEC) * 1000UL;
 constexpr uint32_t DISPLAY_REFRESH_MS = 1000UL;
 constexpr uint32_t LONG_PRESS_MS = 800UL;
 
@@ -2421,6 +2423,51 @@ void refreshDisplayIfDue(uint32_t now) {
 // Display power / brightness
 // =============================================================================
 
+#if DISPLAY_AUTO_BRIGHTNESS
+uint8_t displayAutoBrightness = App::BRIGHTNESS_LEVELS[App::DEFAULT_BRIGHTNESS_INDEX];
+uint32_t displayBrightnessUpdatedMs = 0;
+uint8_t displayLuxBrightness(uint32_t lux) {
+  if (lux <= 10) return 40 + lux;
+  if (lux <= 50) return 50 + (lux - 10) * 20 / 40;
+  if (lux <= 300) return 70 + (lux - 50) * 50 / 250;
+  if (lux <= 1000) return 120 + (lux - 300) * 60 / 700;
+  if (lux < 2000) return 180 + (lux - 1000) * 40 / 1000;
+  return 220;
+}
+uint8_t displayBrightnessTarget(uint32_t now) {
+  // Last successful sample survives transient errors, within existing freshness.
+  if (dlightAvailable && haveLux && uint32_t(now - lastLuxMs) < App::DLIGHT_STALE_MS) {
+    return displayLuxBrightness(uint32_t(dlightLux <= 0 ? 0 : dlightLux >= 2000 ? 2000 : dlightLux));
+  }
+  return App::BRIGHTNESS_LEVELS[brightnessIndex];
+}
+void maintainDisplayBrightness(uint32_t now) {
+  if (uint32_t(now - displayBrightnessUpdatedMs) < 50) return;
+  displayBrightnessUpdatedMs = now;
+  const uint8_t target = displayBrightnessTarget(now);
+  // One step per service, no catch-up burst after a blocked loop.
+  if (displayAutoBrightness < target) ++displayAutoBrightness;
+  else if (displayAutoBrightness > target) --displayAutoBrightness;
+  if (!displaySleeping && M5.Display.getBrightness() != displayAutoBrightness) {
+    M5.Display.setBrightness(displayAutoBrightness);
+  }
+}
+#endif
+uint8_t displayWakeBrightness() {
+#if DISPLAY_AUTO_BRIGHTNESS
+  // Apply the latest target while OFF, avoiding a bright flash on wake.
+  displayAutoBrightness = displayBrightnessTarget(millis());
+  displayBrightnessUpdatedMs = millis();
+  return displayAutoBrightness;
+#else
+  return App::BRIGHTNESS_LEVELS[brightnessIndex];
+#endif
+}
+#if DISPLAY_KEEP_ON_WHEN_OCCUPIED
+bool displayOccupancyHeld = false, displayOccupancyReleased = false;
+uint32_t displayOccupancyReleasedMs = 0;
+#endif
+
 void registerUserActivity() {
   lastUserActivityMs = millis();
 }
@@ -2442,8 +2489,7 @@ void wakeDisplay() {
   displaySleeping = false;
   registerUserActivity();
 
-  M5.Display.setBrightness(
-    App::BRIGHTNESS_LEVELS[brightnessIndex]);
+  M5.Display.setBrightness(displayWakeBrightness());
 
   drawScreen();
 
@@ -2489,11 +2535,35 @@ void cycleBrightness() {
 }
 
 void maintainDisplaySleep(uint32_t now) {
-  if (displaySleeping) return;
-
-  if (intervalElapsed(now, lastUserActivityMs, App::DISPLAY_SLEEP_MS)) {
-    sleepDisplay();
+#if DISPLAY_KEEP_ON_WHEN_OCCUPIED
+  // Raw motion never extends the presence hold. A single read error is tolerated
+  // only while the last successful TMOS sample is still fresh.
+  const bool keepOn = tmosAvailable && haveTmosSample &&
+    uint32_t(now - lastTmosSampleMs) < App::TMOS_STALE_MS && occupied(now);
+  if (displayOccupancyHeld && !keepOn) {
+    displayOccupancyReleasedMs = now;
+    displayOccupancyReleased = true;
   }
+  displayOccupancyHeld = keepOn;
+  if (keepOn) {
+    if (displaySleeping) {
+      displaySleeping = false;
+      M5.Display.setBrightness(displayWakeBrightness());
+      drawScreen();
+      Serial.println("Display: wake (occupancy)");
+    }
+    return;
+  }
+#endif
+  if (displaySleeping || App::DISPLAY_SLEEP_MS == 0) return;
+  uint32_t inactiveMs = uint32_t(now - lastUserActivityMs);
+#if DISPLAY_KEEP_ON_WHEN_OCCUPIED
+  if (displayOccupancyReleased) {
+    const uint32_t releasedMs = uint32_t(now - displayOccupancyReleasedMs);
+    if (releasedMs < inactiveMs) inactiveMs = releasedMs;
+  }
+#endif
+  if (inactiveMs >= App::DISPLAY_SLEEP_MS) sleepDisplay();
 }
 
 // =============================================================================
@@ -3022,6 +3092,9 @@ void loop() {
   maintainLightFeedback(millis());
   maintainLightSound();
 
+#if DISPLAY_AUTO_BRIGHTNESS
+  maintainDisplayBrightness(millis());
+#endif
   maintainDisplaySleep(millis());
   maintainImu(now);
 

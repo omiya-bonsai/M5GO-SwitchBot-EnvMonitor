@@ -77,9 +77,12 @@ B 短押しによる循環順序：
 
 短押しは離したとき、長押しは保持中に1回実行し、その後の短押し処理は抑制します。Display OFF 中は、どのボタンの短押し／長押しも現在のページのまま Wake するだけで、通常の操作は実行しません。短押しは離した時点、長押しは800 ms到達時点で Wake します。
 
-LCD 輝度は `40 → 80 → 120 → 160 → 220 → 40`。初期値160、NVS（`envmonitor` / `brightness`）へ保存します。点灯中は約1秒ごと、有効な MQTT 受信時、ボタン操作時に描画します。傾斜操作はページ変更とグラフ読み込みを行い、通常の更新で描画されます。
+保存される手動LCD 輝度は `40 → 80 → 120 → 160 → 220 → 40`。初期値160、NVS（`envmonitor` / `brightness`）へ保存します。点灯中は約1秒ごと、有効な MQTT 受信時、ボタン操作時に描画します。傾斜操作はページ変更とグラフ読み込みを行い、通常の更新で描画されます。
 
-最後の操作時刻から180秒でバックライトを消灯します。ボタン、Wake、成立した傾斜操作が操作時刻を更新します。点灯中の通常の動きや MQTT 受信では更新しません。ESP32 の Sleep ではなく、消灯中も通信・再接続・NTP・SD ログ・IMU・HEALTH 監視を継続します。MQTT 受信で Display を Wake しません。
+有効な在室Keep-ON中を除き、最後の操作または直近の在室解除から設定時間（既定180秒）でバックライトを消灯します。ボタン、物理ボタン／IMUのWake、成立した傾斜操作が操作時刻を更新します。TMOS Wakeでは更新しません。点灯中の通常の動きや MQTT 受信では更新しません。ESP32 の Sleep ではなく、消灯中も通信・再接続・NTP・SD ログ・IMU・HEALTH 監視を継続します。MQTT 受信で Display を Wake しません。
+
+`config.h`の`DISPLAY_KEEP_ON_WHEN_OCCUPIED=1`で、有効なTMOS在室中はDisplayを自動ON・保持します。退室後は`DISPLAY_SLEEP_TIMEOUT_SEC`から消灯までをカウントします（既定180秒、0で自動消灯無効）。`DISPLAY_AUTO_BRIGHTNESS=1`でDLight luxに応じてLCD輝度を滑らかに調整し、利用不能時は保存された手動輝度へ戻します。0では従来の手動輝度です。A長押しの手動設定保存は両モードで維持します。
+
 
 ## 再起動後の UI 状態復元（v0.6.1）
 
@@ -94,7 +97,7 @@ USB 抜去時には一瞬の電源断と ESP32 の `POWERON_RESET` が観測さ�
 
 キー欠落、型不一致、範囲外の値は MAIN／輝度160へフォールバックします。既存の輝度保存値も引き継ぎます。NVS は B/C または IMU でページが実際に変わったとき、および A 長押しで輝度が変わったときだけ書き込みます。同じページの再選択は保存しません。起動時の復元、再描画、MQTT 受信、通常の loop、Wake、自動／手動消灯では書き込みません。NVS 初期化失敗時は既定値で継続して永続化を無効にし、保存失敗時もログを出して動作を継続します。書き込み確定前の電源断では、前の保存値が残る可能性があります。
 
-起動順序は M5 初期化 → LCD/NVS 状態読み込み・8-bit canvas 確保 → IMU → RGB → SD → MQTT 設定 → Wi-Fi 接続開始 → 復元ページの初回描画です。SD 初期化前に復元ページを描画しません。グラフ読み込みは SD／時計が有効になるまで待ち、NTP 後のグラフ再描画で再試行します。統計は描画時に計算します。時刻やデータが得られるまでは履歴なし表示や `--` になります。180秒の無操作タイマーは起動後に開始し直します。
+起動順序は M5 初期化 → LCD/NVS 状態読み込み・8-bit canvas 確保 → IMU → RGB → SD → MQTT 設定 → Wi-Fi 接続開始 → 復元ページの初回描画です。SD 初期化前に復元ページを描画しません。グラフ読み込みは SD／時計が有効になるまで待ち、NTP 後のグラフ再描画で再試行します。統計は描画時に計算します。時刻やデータが得られるまでは履歴なし表示や `--` になります。設定された無操作タイマーは起動後に開始し直します。
 
 Wi-Fi／MQTT は通常どおり再接続・subscribe し、retained MQTT から環境値を再取得します。温湿度、data age、時刻、RSSI、通信／セッション状態、グラフデータは NVS に保存せず、MQTT・時刻サービス・SD から再構築します。鮮度判定は従来どおり有効な受信時刻が基準です。
 
@@ -125,6 +128,7 @@ KEY UNITをPort Bへ接続します。白線のボタン信号はGPIO36（LOWで
 標準構成ではKEYをPort Bへ常設し、既定は`#define KEY_UNIT_ENABLED 1`です。KEYを取り外して運用する場合は`0`へ変更して再ビルドしてください。`0`ではKEY初期化・GPIO36監視・操作をコンパイル対象から除外します。GPIO36は入力専用で内部pull-upがないため、有効時は`INPUT`を使用し、UNIT内の10kΩ pull-upを前提とします。外付け抵抗は追加しません。UNIT未接続・取り外し時はKEYを無効にしてください。
 
 30msのnon-blocking debounceで押下時に1回だけtoggleし、debounce済みrelease後に次の押下を受け付けます。起動時に押されていてもtoggleせず、一度離して押し直す必要があります。C長押しと同じ`publishStudyLightToggle()`を呼び、MQTT PRESS・成功時LED・`/sounds/light-toggle.wav`を共用します。失敗時・音声再生中の仕様も既存どおりです。KEYはDisplay OFF中も有効で、Display Wakeや無操作タイマー更新は行いません。A/B/CのWake-onlyは変更しません。GPIO26のKEY内蔵SK6812は暖色の待機表示として、約3〜20%の明るさで穏やかな1/fゆらぎ風明滅を行います。押下中・Display OFF中も継続し、基準色は時刻を識別しやすい色相環の24色を隣接時刻間で連続補間します（時刻同期前は暖色）。既存の輝度ゆらぎを維持し、DLight luxに応じて全体の輝度を連続補正・緩やかに追従させます。DLight利用不能・stale時は標準輝度へ滑らかに戻します。固定小数点で3つの滑らかな低周波成分を合成して、独立した非同期RMTで送信します。追加LEDライブラリは不要です。KEY_UNIT_ENABLED=0ではボタン・LEDとも除外し、LED初期化失敗時もボタンは使用できます。
+
 
 debounce済みイベントは`PERF KEY press t=...`、`PERF KEY action t=...`、`PERF KEY release t=...`で確認できます。actionは操作試行を示し、MQTT成功／失敗は既存LIGHTログで確認します。
 
@@ -175,7 +179,7 @@ MQTTは`home/env/study/context`へnon-retained・QoS0でpublishします。分�
 
 無効なluxは`null`と`light_state:"UNKNOWN"`、無効なpresence／motionは`null`、複合contextは`UNKNOWN`です。MQTT失敗でも観測値や照明操作権限は変化しません。Serialは正常な照度値を1秒ごと（`DLIGHT: lux=327.4 state=NORMAL`）、context遷移とread failure／recoveryを出力します。PERFへ`dlight_poll_max_us`、`last_us`、`dlight_calls`、`dlight_errors`を追加しました。I²C readのみを測り、Serial／MQTT／LCD時間は含めません。変換待ちはセンサー内部で行い、loopで待ちません。I²C通信そのものは既存ドライバーのtimeoutに従う同期処理です。
 
-context SDログとDLightグラフは追加していません。既存温湿度・システムCSVのschema、Graph／STATS cache、ボタン、NVS、IMU、180秒auto-offを維持しています。
+context SDログとDLightグラフは追加していません。既存温湿度・システムCSVのschema、Graph／STATS cache、ボタン、NVS、IMUを維持しています。Displayの消灯と輝度は前述の設定で制御します。
 
 ## IMU ジェスチャー
 

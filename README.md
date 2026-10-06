@@ -77,9 +77,12 @@ B short press cycles:
 
 Short actions occur on release; long actions occur once while held and suppress the short action. While Display OFF, any short or long button action only wakes the display, keeping the current page; its normal action is consumed. Wake occurs at release for a short press or at 800 ms for a long press.
 
-LCD brightness cycles `40 → 80 → 120 → 160 → 220 → 40`; default is 160 and the setting is saved in NVS (`envmonitor` / `brightness`). The display refreshes approximately once a second while on, and also on valid MQTT receipt or button actions. Tilt changes the page and requests graph loading; the regular refresh renders it.
+The saved manual LCD brightness cycles `40 → 80 → 120 → 160 → 220 → 40`; default is 160 and the setting is saved in NVS (`envmonitor` / `brightness`). The display refreshes approximately once a second while on, and also on valid MQTT receipt or button actions. Tilt changes the page and requests graph loading; the regular refresh renders it.
 
-The backlight turns off after 180 seconds without registered activity. Buttons, wake and successful tilt register activity; ordinary motion while on and MQTT receipt do not. This is backlight shutoff, not ESP32 sleep: MQTT, network recovery, NTP, SD logging, IMU and health monitoring continue. MQTT never wakes the display.
+Unless valid occupancy keep-on is active, the backlight turns off after the configured timeout (default 180 seconds), counted from registered activity or the most recent occupancy release. Buttons, physical/IMU wake and successful tilt register activity; occupancy wake does not. ordinary motion while on and MQTT receipt do not. This is backlight shutoff, not ESP32 sleep: MQTT, network recovery, NTP, SD logging, IMU and health monitoring continue. MQTT never wakes the display.
+
+Display options in `config.h`: `DISPLAY_KEEP_ON_WHEN_OCCUPIED=1` wakes/keeps the display on while TMOS occupancy is valid; after occupancy ends, `DISPLAY_SLEEP_TIMEOUT_SEC` starts a new sleep countdown (default 180 seconds; 0 disables auto-sleep). `DISPLAY_AUTO_BRIGHTNESS=1` smoothly adjusts LCD brightness from DLight lux, falling back to the saved manual brightness when unavailable. Set it to 0 for conventional manual brightness. A-long still stores the manual selection in either mode.
+
 
 ## Restart and UI restoration (v0.6.1)
 
@@ -94,7 +97,7 @@ USB removal has been observed to briefly interrupt power and restart the ESP32 w
 
 Missing, wrong-type or out-of-range values fall back to MAIN and brightness 160. Existing brightness settings remain compatible. NVS is written only when the page actually changes through B/C or IMU, or A-long changes brightness. Re-selecting the current page does not write. Boot restoration, redraws, MQTT receipt, normal loop iterations, wake and automatic/manual display shutoff do not write. Failed NVS initialization leaves defaults and disables persistence; failed writes are logged without stopping operation. A power loss before a write commits can leave the previous saved state.
 
-Startup order remains M5 initialization → LCD/NVS state load and 8-bit canvas allocation → IMU → RGB → SD → MQTT configuration → Wi-Fi connection start → first restored-page draw. No restored page is drawn before SD initialization. Graph loading waits for valid SD/time and retries on graph redraws after NTP; statistics are calculated on draw. Until time/data is available, empty-history indicators or `--` can appear. The 180-second activity timer starts again after startup.
+Startup order remains M5 initialization → LCD/NVS state load and 8-bit canvas allocation → IMU → RGB → SD → MQTT configuration → Wi-Fi connection start → first restored-page draw. No restored page is drawn before SD initialization. Graph loading waits for valid SD/time and retries on graph redraws after NTP; statistics are calculated on draw. Until time/data is available, empty-history indicators or `--` can appear. The configured activity timer starts again after startup.
 
 Wi-Fi and MQTT reconnect normally, subscribe, and reacquire environmental values from retained MQTT. Temperature/humidity, measurement age, time, RSSI, network/session state and graph data are not saved in NVS; they are rebuilt from MQTT, time services and SD. Freshness is still measured from valid receipt time.
 
@@ -125,6 +128,7 @@ Connect Unit Key to Port B: white button signal → GPIO36 (active LOW), yellow 
 The standard configuration has Unit Key permanently connected to Port B and `#define KEY_UNIT_ENABLED 1`. For operation without Unit Key, set it to `0` and rebuild. At `0`, KEY initialization, GPIO36 polling and actions are excluded at compile time. GPIO36 is input-only without internal pull-up; enabled mode uses `INPUT` and relies on Unit Key's internal10kΩ pull-up. No external pull-up is added; do not leave KEY enabled with the unit absent/disconnected.
 
 A30ms non-blocking debounce accepts a press once and rearms only after a debounced release. A key held at boot does not toggle until released and pressed again. KEY calls the same `publishStudyLightToggle()` as C-long: MQTT PRESS, success LED feedback and `/sounds/light-toggle.wav`, with existing failure and audio-busy behavior. KEY works with Display OFF and never wakes the display or updates its inactivity timer. Physical A/B/C wake-only behavior is unchanged. GPIO26 independently drives Unit Key's SK6812 as a warm standby indicator: gentle, irregular brightness changes (~3–20%) continue during button presses and Display OFF. The base color follows 24 distinct hourly hue-circle points interpolated in local time (warm fallback before clock synchronization). DLight lux continuously scales the existing brightness fluctuation with gradual tracking; unavailable or stale DLight returns smoothly to standard brightness. Three smooth low-frequency components are combined using fixed-point arithmetic and sent through an independent asynchronous RMT channel, without a new LED library. KEY_UNIT_ENABLED=0 excludes both button and LED; LED initialization failure leaves the button usable.
+
 
 Debounced events produce `PERF KEY press t=...`, `PERF KEY action t=...`, and `PERF KEY release t=...`. Action means an attempt; the existing LIGHT log reports MQTT publication success/failure.
 
@@ -175,7 +179,7 @@ MQTT publishes non-retained QoS0 snapshots to `home/env/study/context` on classi
 
 Invalid lux is `null` with `light_state:"UNKNOWN"`; invalid presence/motion are `null`, and combined context is `UNKNOWN`. MQTT failure does not change observations or trigger light actions. Serial prints successful DLight readings once per1s (`DLIGHT: lux=327.4 state=NORMAL`), context transitions and read failure/recovery. PERF adds `dlight_poll_max_us`, `last_us`, `dlight_calls`, `dlight_errors`; this measures only the I²C read, excluding Serial/MQTT/LCD. Conversion completes in the sensor with no loop wait; physical I²C transactions remain synchronous under existing driver timeouts.
 
-No context SD log or DLight graph is added. Existing temperature/humidity and system CSV schemas, Graph/STATS caches, buttons, NVS, IMU and180s auto-off remain unchanged.
+No context SD log or DLight graph is added. Existing temperature/humidity and system CSV schemas, Graph/STATS caches, buttons, NVS, IMU remain unchanged; Display sleep and brightness are configurable as described above.
 
 ## IMU gestures
 
