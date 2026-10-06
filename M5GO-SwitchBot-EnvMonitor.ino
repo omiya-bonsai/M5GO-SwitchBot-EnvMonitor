@@ -1124,6 +1124,34 @@ void maintainKeyUnit() {
 constexpr int KEY_LED_PIN = 26;
 constexpr uint8_t KEY_LED_MIN_BRIGHTNESS = 8, KEY_LED_MAX_BRIGHTNESS = 51;  // 8/255 to 51/255.
 constexpr uint8_t KEY_LED_RED = 255, KEY_LED_GREEN = 100, KEY_LED_BLUE = 20;
+struct KeyLedColor { uint8_t r, g, b; };
+KeyLedColor keyLedTimeColor(const struct tm& localTime);  // Keep Arduino prototype after the type.
+static constexpr KeyLedColor KEY_LED_HOURLY_COLORS[24] = {
+  {40,50,255}, {50,40,255}, {65,35,255}, {85,30,255},   // 00-03: deep blue / violet
+  {135,25,255}, {255,30,140}, {255,65,25}, {255,130,25}, // 04-07: pre-dawn / sunrise
+  {255,195,60}, {255,220,135}, {255,235,185}, {255,245,215}, // 08-11: morning
+  {255,250,235}, {255,248,225}, {255,240,195}, {255,220,140}, // 12-15: daylight
+  {255,190,75}, {255,120,30}, {255,60,35}, {255,35,130}, // 16-19: sunset / night
+  {155,30,255}, {65,50,255}, {35,60,255}, {45,45,255}    // 20-23: violet / blue
+};
+KeyLedColor keyLedBaseColor = {KEY_LED_RED, KEY_LED_GREEN, KEY_LED_BLUE};
+uint32_t keyLedColorUpdatedMs = 0;
+
+KeyLedColor keyLedTimeColor(const struct tm& localTime) {
+  const KeyLedColor& a = KEY_LED_HOURLY_COLORS[localTime.tm_hour];
+  const KeyLedColor& b = KEY_LED_HOURLY_COLORS[(localTime.tm_hour + 1) % 24];
+  const uint32_t progress = localTime.tm_min * 60 + localTime.tm_sec;
+  return {
+    uint8_t((a.r * (3600 - progress) + b.r * progress + 1800) / 3600),
+    uint8_t((a.g * (3600 - progress) + b.g * progress + 1800) / 3600),
+    uint8_t((a.b * (3600 - progress) + b.b * progress + 1800) / 3600)
+  };
+}
+void updateKeyLedColor() {
+  struct tm localTime;
+  keyLedBaseColor = getLocalTimeSafe(localTime) ? keyLedTimeColor(localTime) :
+    KeyLedColor{KEY_LED_RED, KEY_LED_GREEN, KEY_LED_BLUE};
+}
 constexpr uint32_t KEY_LED_UPDATE_MS = 30;
 // Three smooth periodic components; amplitudes sum to 21.5 around 29.5.
 constexpr uint32_t KEY_LED_PERIOD_MS[] = {17311, 7103, 2909};
@@ -1148,9 +1176,9 @@ uint32_t keyLedBrightness() {
 }
 bool sendKeyLed(uint32_t brightness) {
   const uint8_t grb[] = {
-    uint8_t(KEY_LED_GREEN * brightness / 255),
-    uint8_t(KEY_LED_RED * brightness / 255),
-    uint8_t(KEY_LED_BLUE * brightness / 255)
+    uint8_t(keyLedBaseColor.g * brightness / 255),
+    uint8_t(keyLedBaseColor.r * brightness / 255),
+    uint8_t(keyLedBaseColor.b * brightness / 255)
   };
   const uint32_t color = (uint32_t(grb[0]) << 16) | (uint32_t(grb[1]) << 8) | grb[2];
   if (color == keyLedLastColor) return true;
@@ -1170,7 +1198,8 @@ void initializeKeyLed() {
   digitalWrite(KEY_LED_PIN, LOW);
   keyLedReady = rmtInit(KEY_LED_PIN, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 10000000);
   if (keyLedReady) {
-    keyLedUpdatedMs = millis();
+    keyLedColorUpdatedMs = keyLedUpdatedMs = millis();
+    updateKeyLedColor();
     keyLedReady = sendKeyLed(keyLedBrightness());
   }
   Serial.println(keyLedReady ? "KEY LED: initialized" : "KEY LED: initialization failed");
@@ -1183,6 +1212,10 @@ void maintainKeyLed() {
   keyLedUpdatedMs = now;
   for (size_t i = 0; i < 3; ++i) {
     keyLedPhaseMs[i] = (keyLedPhaseMs[i] + elapsed % KEY_LED_PERIOD_MS[i]) % KEY_LED_PERIOD_MS[i];
+  }
+  if (uint32_t(now - keyLedColorUpdatedMs) >= 1000) {
+    keyLedColorUpdatedMs = now;
+    updateKeyLedColor();
   }
   const uint32_t brightness = keyLedBrightness();
   if (!sendKeyLed(brightness)) keyLedReady = false;  // Button remains independent.

@@ -122,7 +122,7 @@ KEY UNITをPort Bへ接続します。白線のボタン信号はGPIO36（LOWで
 
 標準構成ではKEYをPort Bへ常設し、既定は`#define KEY_UNIT_ENABLED 1`です。KEYを取り外して運用する場合は`0`へ変更して再ビルドしてください。`0`ではKEY初期化・GPIO36監視・操作をコンパイル対象から除外します。GPIO36は入力専用で内部pull-upがないため、有効時は`INPUT`を使用し、UNIT内の10kΩ pull-upを前提とします。外付け抵抗は追加しません。UNIT未接続・取り外し時はKEYを無効にしてください。
 
-30msのnon-blocking debounceで押下時に1回だけtoggleし、debounce済みrelease後に次の押下を受け付けます。起動時に押されていてもtoggleせず、一度離して押し直す必要があります。C長押しと同じ`publishStudyLightToggle()`を呼び、MQTT PRESS・成功時LED・`/sounds/light-toggle.wav`を共用します。失敗時・音声再生中の仕様も既存どおりです。KEYはDisplay OFF中も有効で、Display Wakeや無操作タイマー更新は行いません。A/B/CのWake-onlyは変更しません。GPIO26のKEY内蔵SK6812は暖色の待機表示として、約3〜20%の明るさで穏やかな1/fゆらぎ風明滅を行います。押下中・Display OFF中も継続し、固定小数点で3つの滑らかな低周波成分を合成し、独立した非同期RMTで送信します。追加LEDライブラリは不要です。KEY_UNIT_ENABLED=0ではボタン・LEDとも除外し、LED初期化失敗時もボタンは使用できます。
+30msのnon-blocking debounceで押下時に1回だけtoggleし、debounce済みrelease後に次の押下を受け付けます。起動時に押されていてもtoggleせず、一度離して押し直す必要があります。C長押しと同じ`publishStudyLightToggle()`を呼び、MQTT PRESS・成功時LED・`/sounds/light-toggle.wav`を共用します。失敗時・音声再生中の仕様も既存どおりです。KEYはDisplay OFF中も有効で、Display Wakeや無操作タイマー更新は行いません。A/B/CのWake-onlyは変更しません。GPIO26のKEY内蔵SK6812は暖色の待機表示として、約3〜20%の明るさで穏やかな1/fゆらぎ風明滅を行います。押下中・Display OFF中も継続し、基準色はローカル時刻の24個の毎時カラーポイントを隣接時刻間で連続補間します（時刻同期前は暖色）。その上に既存の輝度ゆらぎを適用し、固定小数点で3つの滑らかな低周波成分を合成して、独立した非同期RMTで送信します。追加LEDライブラリは不要です。KEY_UNIT_ENABLED=0ではボタン・LEDとも除外し、LED初期化失敗時もボタンは使用できます。
 
 debounce済みイベントは`PERF KEY press t=...`、`PERF KEY action t=...`、`PERF KEY release t=...`で確認できます。actionは操作試行を示し、MQTT成功／失敗は既存LIGHTログで確認します。
 
