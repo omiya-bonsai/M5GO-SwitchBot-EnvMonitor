@@ -1126,13 +1126,14 @@ constexpr uint8_t KEY_LED_MIN_BRIGHTNESS = 8, KEY_LED_MAX_BRIGHTNESS = 51;  // 8
 constexpr uint8_t KEY_LED_RED = 255, KEY_LED_GREEN = 100, KEY_LED_BLUE = 20;
 struct KeyLedColor { uint8_t r, g, b; };
 KeyLedColor keyLedTimeColor(const struct tm& localTime);  // Keep Arduino prototype after the type.
+// One hue-circle revolution, starting at blue; brightness is handled separately.
 static constexpr KeyLedColor KEY_LED_HOURLY_COLORS[24] = {
-  {40,50,255}, {50,40,255}, {65,35,255}, {85,30,255},   // 00-03: deep blue / violet
-  {135,25,255}, {255,30,140}, {255,65,25}, {255,130,25}, // 04-07: pre-dawn / sunrise
-  {255,195,60}, {255,220,135}, {255,235,185}, {255,245,215}, // 08-11: morning
-  {255,250,235}, {255,248,225}, {255,240,195}, {255,220,140}, // 12-15: daylight
-  {255,190,75}, {255,120,30}, {255,60,35}, {255,35,130}, // 16-19: sunset / night
-  {155,30,255}, {65,50,255}, {35,60,255}, {45,45,255}    // 20-23: violet / blue
+  {0,0,255}, {64,0,255}, {128,0,255}, {191,0,255},
+  {255,0,255}, {255,0,191}, {255,0,128}, {255,0,64},
+  {255,0,0}, {255,64,0}, {255,128,0}, {255,191,0},
+  {255,255,0}, {191,255,0}, {128,255,0}, {64,255,0},
+  {0,255,0}, {0,255,64}, {0,255,128}, {0,255,191},
+  {0,255,255}, {0,191,255}, {0,128,255}, {0,64,255}
 };
 KeyLedColor keyLedBaseColor = {KEY_LED_RED, KEY_LED_GREEN, KEY_LED_BLUE};
 uint32_t keyLedColorUpdatedMs = 0;
@@ -1173,6 +1174,36 @@ uint32_t keyLedBrightness() {
     10 * keyLedWave(keyLedPhaseMs[1], KEY_LED_PERIOD_MS[1]) +
     3 * keyLedWave(keyLedPhaseMs[2], KEY_LED_PERIOD_MS[2]);
   return uint32_t(29 * 1024 + 512 + sum / 2 + 512) / 1024;
+}
+// Factor is in thousandths. Slew at 4 units/30ms (~0.133 per second).
+uint16_t keyLedAmbientFactor = 1000, keyLedAmbientTarget = 1000;
+uint32_t keyLedAmbientUpdatedMs = 0;
+uint16_t keyLedLuxFactor(uint32_t lux) {
+  if (lux <= 10) return 450 + lux * 5;
+  if (lux <= 50) return 500 + (lux - 10) * 150 / 40;
+  if (lux <= 300) return 650 + (lux - 50) * 350 / 250;
+  if (lux < 1000) return 1000 + (lux - 300) * 250 / 700;
+  return 1250;
+}
+uint32_t applyKeyLedAmbient(uint32_t brightness, uint32_t now, uint32_t elapsed) {
+  if (uint32_t(now - keyLedAmbientUpdatedMs) >= 1000) {
+    keyLedAmbientUpdatedMs = now;
+    // Keep the last successful sample through transient errors; expire at 3s.
+    keyLedAmbientTarget = dlightAvailable && haveLux &&
+      uint32_t(now - lastLuxMs) < App::DLIGHT_STALE_MS ?
+      keyLedLuxFactor(uint32_t(dlightLux <= 0 ? 0 : dlightLux >= 1000 ? 1000 : dlightLux)) : 1000;
+  }
+  // Cap catch-up after a blocked loop, so recovery cannot jump the factor.
+  const uint32_t step = (elapsed > 60 ? 60 : elapsed) * 4 / 30;
+  if (keyLedAmbientFactor < keyLedAmbientTarget) {
+    const uint32_t gap = keyLedAmbientTarget - keyLedAmbientFactor;
+    keyLedAmbientFactor += gap < step ? gap : step;
+  } else {
+    const uint32_t gap = keyLedAmbientFactor - keyLedAmbientTarget;
+    keyLedAmbientFactor -= gap < step ? gap : step;
+  }
+  const uint32_t scaled = (brightness * keyLedAmbientFactor + 500) / 1000;
+  return scaled > 255 ? 255 : scaled;
 }
 bool sendKeyLed(uint32_t brightness) {
   const uint8_t grb[] = {
@@ -1218,7 +1249,7 @@ void maintainKeyLed() {
     updateKeyLedColor();
   }
   const uint32_t brightness = keyLedBrightness();
-  if (!sendKeyLed(brightness)) keyLedReady = false;  // Button remains independent.
+  if (!sendKeyLed(applyKeyLedAmbient(brightness, now, elapsed))) keyLedReady = false;  // Button remains independent.
 }
 #endif  // KEY_UNIT_ENABLED
 
