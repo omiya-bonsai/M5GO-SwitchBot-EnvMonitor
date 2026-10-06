@@ -1,6 +1,6 @@
 [English](README.md) | **日本語**
 
-# M5GO SwitchBot EnvMonitor — v0.7.0
+# M5GO SwitchBot EnvMonitor — v0.8.0
 
 M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジェクトです。Home Assistant が取得した SwitchBot の温湿度を MQTT broker 経由で受信し、現在値、SD 上の履歴・統計を表示します。内蔵 LED は環境異常のインジケーターとして使います。
 
@@ -36,7 +36,7 @@ M5Stack M5GO v2.7 を常設環境モニターとして使う Arduino プロジ�
 
 Charger Base は任意であり、ファームウェア動作の必須要件ではありません。常時運用には適切な電源が必要です。バッテリー持続時間は規定していません。
 
-以下は提示された対象環境です。リポジトリに依存バージョンの固定設定はありません。v0.7.0 はローカル導入済みの M5Stack ESP32 package 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、PubSubClient 2.8、ArduinoJson 7.4.3 でビルド成功しました（`m5stack:esp32:m5stack_core`、プレースホルダー設定）。指定の M5Unified 0.2.25／M5GFX 0.2.32 の組み合わせや実機動作を検証したものではありません。
+以下は提示された対象環境です。リポジトリに依存バージョンの固定設定はありません。v0.8.0 はローカル導入済みの M5Stack ESP32 package 3.3.9、M5Unified 0.2.21、M5GFX 0.2.28、PubSubClient 2.8、ArduinoJson 7.4.3 でビルド成功しました（`m5stack:esp32:m5stack_core`、プレースホルダー設定）。指定の M5Unified 0.2.25／M5GFX 0.2.32 の組み合わせや実機動作を検証したものではありません。
 
 | 依存ソフトウェア | バージョン／用途 |
 | --- | --- |
@@ -116,6 +116,16 @@ Display ON 中の C 長押し（800 ms）で、既存の MQTT 接続を使い `h
 
 LED は従来どおり約300 msで終了し、音と独立して環境表示へ戻ります。SD／ファイルなし、WAV 不正、Speaker 初期化／キュー投入失敗は AUDIO 警告を出すだけで、MQTT 成功と LED を妨げません。MQTT 失敗時や Display OFF の Wake では音を開始しません。再生中の再度の有効 C 長押しでは MQTT と LED は通常どおり実行し、音のみスキップして多重再生／再スタートしません。音はコマンド送信のフィードバックであり、実際の照明 ON/OFF や HA 実行確認ではありません。起動音は要求しません。圧縮／float／extensible WAV は拒否し、それらの場合のみ PCM 変換が必要です。指定の標準48 kHz WAV の変換は不要です。
 
+## KEY UNIT（任意、Port B）
+
+KEY UNITをPort Bへ接続します。白線のボタン信号はGPIO36（LOWで押下）、黄線のSK6812入力はGPIO26（未使用）です。[KEY公式PinMap](https://docs.m5stack.com/en/unit/Unit_Key)と[M5GO v2.7 Port B PinMap](https://docs.m5stack.com/en/core/M5GO_IoT_Kit_v2.7)に対応しています。追加ライブラリは不要です。
+
+標準構成ではKEYをPort Bへ常設し、既定は`#define KEY_UNIT_ENABLED 1`です。KEYを取り外して運用する場合は`0`へ変更して再ビルドしてください。`0`ではKEY初期化・GPIO36監視・操作をコンパイル対象から除外します。GPIO36は入力専用で内部pull-upがないため、有効時は`INPUT`を使用し、UNIT内の10kΩ pull-upを前提とします。外付け抵抗は追加しません。UNIT未接続・取り外し時はKEYを無効にしてください。
+
+30msのnon-blocking debounceで押下時に1回だけtoggleし、debounce済みrelease後に次の押下を受け付けます。起動時に押されていてもtoggleせず、一度離して押し直す必要があります。C長押しと同じ`publishStudyLightToggle()`を呼び、MQTT PRESS・成功時LED・`/sounds/light-toggle.wav`を共用します。失敗時・音声再生中の仕様も既存どおりです。KEYはDisplay OFF中も有効で、Display Wakeや無操作タイマー更新は行いません。A/B/CのWake-onlyは変更しません。KEY内蔵SK6812は制御せず、GPIO26には触れません。
+
+debounce済みイベントは`PERF KEY press t=...`、`PERF KEY action t=...`、`PERF KEY release t=...`で確認できます。actionは操作試行を示し、MQTT成功／失敗は既存LIGHTログで確認します。
+
 ## Port A TMOS（任意）
 
 TMOS PIR UNIT（STHS34PF80、I²C `0x5A`）をPort A（SDA GPIO21／SCL GPIO22）へ接続します。M5Unifiedの既存`In_I2C`を共有し、UNIT通信は100kHz。バスを解放・再初期化せず、内蔵IMUとの通信を維持します。
@@ -140,7 +150,7 @@ TMOS（`0x5A`）とDLight／BH1750FVI（`0x23`）をY字GROVEでPort Aへ接続�
 | DLight | 照度観測。連続高分解能モード（`0x10`）、1秒周期読み取り。16-bit big-endian生値／1.2 |
 | 物理C長押し | 明示的な照明toggle。既存MQTT・LED・効果音を維持 |
 
-**TMOS／DLightは照明の自動操作やDisplayのWake／sleepを行いません。** KEY UNITは今回未実装で、明示的な操作入力として別途検討します。Gestureは撤去したままです。
+**TMOS／DLightは照明の自動操作やDisplayのWake／sleepを行いません。** KEY UNITは有効化した場合のみ明示的な照明操作入力となります（上記参照）。Gestureは撤去したままです。
 
 | lux | 照度分類 |
 | --- | --- |

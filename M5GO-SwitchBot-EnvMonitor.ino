@@ -27,13 +27,16 @@
 // Application
 // =============================================================================
 
+#define KEY_UNIT_ENABLED 1  // Enable only with Unit Key connected (GPIO36 has no internal pull-up).
 #define TMOS_DIAGNOSTICS 0  // 0: normal operation, 1: detailed TMOS state diagnostics
 
 namespace App {
 constexpr char NAME[] = "M5GO-SwitchBot-EnvMonitor";
-constexpr char VERSION[] = "0.7.0";
+constexpr char VERSION[] = "0.8.0";
 constexpr uint32_t UNIT_I2C_HZ = 100000;
 constexpr uint32_t TMOS_POLL_MS = 50;
+constexpr int KEY_INPUT_PIN = 36;
+constexpr uint32_t KEY_DEBOUNCE_MS = 30;
 constexpr uint32_t DLIGHT_POLL_MS = 1000, DLIGHT_STALE_MS = 3000;
 constexpr uint32_t TMOS_STALE_MS = 2000, PRESENCE_HOLD_MS = 10000;
 constexpr float DLIGHT_DARK_LUX = 50, DLIGHT_NORMAL_LUX = 300, DLIGHT_BRIGHT_LUX = 1000;
@@ -1087,6 +1090,37 @@ void publishStudyLightToggle() {
   }
   startLightSound();
 }
+
+#if KEY_UNIT_ENABLED
+bool keyRawPressed = false, keyStablePressed = false, keyArmed = false;
+uint32_t keyRawChangedMs = 0;
+
+void initializeKeyUnit() {
+  // GPIO36 is input-only and has no internal pull-up. Unit Key supplies its own.
+  // GPIO26 (the Unit's SK6812 input) is intentionally untouched.
+  pinMode(App::KEY_INPUT_PIN, INPUT);
+  keyRawPressed = digitalRead(App::KEY_INPUT_PIN) == LOW;
+  keyStablePressed = keyRawPressed;
+  keyRawChangedMs = millis();
+  keyArmed = false;  // Require a debounced release; never act on a held key at boot.
+}
+void maintainKeyUnit() {
+  const uint32_t now = millis();
+  const bool pressed = digitalRead(App::KEY_INPUT_PIN) == LOW;
+  if (pressed != keyRawPressed) { keyRawPressed = pressed; keyRawChangedMs = now; }
+  if (uint32_t(now - keyRawChangedMs) < App::KEY_DEBOUNCE_MS) return;
+  if (!keyRawPressed && !keyStablePressed) { keyArmed = true; return; }
+  if (keyRawPressed == keyStablePressed) return;
+  keyStablePressed = keyRawPressed;
+  Serial.printf("PERF KEY %s t=%lu\n", keyStablePressed ? "press" : "release", (unsigned long)now);
+  if (!keyStablePressed) { keyArmed = true; return; }
+  if (!keyArmed) return;
+  keyArmed = false;
+  Serial.printf("PERF KEY action t=%lu\n", (unsigned long)now);
+  // Dedicated light key: do not wake the display or update its activity timer.
+  publishStudyLightToggle();
+}
+#endif  // KEY_UNIT_ENABLED
 
 void initializeRgbLeds() {
 
@@ -2819,6 +2853,9 @@ void setup() {
   initializeRgbLeds();
   initializeSdCard();
   initializePortAUnits();
+#if KEY_UNIT_ENABLED
+  initializeKeyUnit();
+#endif
   configureMQTT();
   configureWiFi();
 
@@ -2839,6 +2876,9 @@ void loop() {
   M5.update();
 
   processButtons(now);
+#if KEY_UNIT_ENABLED
+  maintainKeyUnit();
+#endif
   maintainPortAUnits();
 
   maintainWiFi(now);

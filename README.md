@@ -1,6 +1,6 @@
 **English** | [日本語](README.ja.md)
 
-# M5GO SwitchBot EnvMonitor — v0.7.0
+# M5GO SwitchBot EnvMonitor — v0.8.0
 
 An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant obtains SwitchBot temperature/humidity measurements and publishes them through an MQTT broker to the M5GO. The device displays current values, SD-backed history and statistics, and uses its built-in LEDs to indicate environmental warnings.
 
@@ -36,7 +36,7 @@ An always-running environmental monitor for M5Stack M5GO v2.7. Home Assistant ob
 
 A Charger Base is optional, not a firmware requirement. Continuous operation requires an appropriate power source; battery runtime is not specified.
 
-The following is the supplied target environment. The repository does not pin dependency versions. v0.7.0 compiled successfully with the locally installed M5Stack ESP32 package 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28, PubSubClient 2.8 and ArduinoJson 7.4.3 (`m5stack:esp32:m5stack_core`, placeholder configuration). This does not verify the exact M5Unified 0.2.25 / M5GFX 0.2.32 combination or device behavior.
+The following is the supplied target environment. The repository does not pin dependency versions. v0.8.0 compiled successfully with the locally installed M5Stack ESP32 package 3.3.9, M5Unified 0.2.21, M5GFX 0.2.28, PubSubClient 2.8 and ArduinoJson 7.4.3 (`m5stack:esp32:m5stack_core`, placeholder configuration). This does not verify the exact M5Unified 0.2.25 / M5GFX 0.2.32 combination or device behavior.
 
 | Dependency | Version / use |
 | --- | --- |
@@ -116,6 +116,16 @@ Volume is `App::LIGHT_TOGGLE_SOUND_VOLUME = 48` (0–255). Three 8 KB PCM buffer
 
 LED feedback still ends after approximately 300 ms and restores environmental LEDs independently of sound. Missing SD/file, invalid WAV, Speaker initialization or queue failure logs an AUDIO warning and does not undo or prevent MQTT/LED success. MQTT failure and Display OFF wake start no sound. A second valid C-long still sends MQTT and restarts LED feedback; sound already active is skipped rather than layered or restarted. Sound means command publication, not actual light ON/OFF or HA confirmation. No boot sound is requested. Compressed/float/extensible WAV is rejected; PCM conversion is needed only for unsupported formats, not the supplied standard 48 kHz file.
 
+## Optional Unit Key (Port B)
+
+Connect Unit Key to Port B: white button signal → GPIO36 (active LOW), yellow SK6812 input → GPIO26 (unused). Mapping follows the [Unit Key PinMap](https://docs.m5stack.com/en/unit/Unit_Key) and [M5GO v2.7 Port B PinMap](https://docs.m5stack.com/en/core/M5GO_IoT_Kit_v2.7). No new library is needed.
+
+The standard configuration has Unit Key permanently connected to Port B and `#define KEY_UNIT_ENABLED 1`. For operation without Unit Key, set it to `0` and rebuild. At `0`, KEY initialization, GPIO36 polling and actions are excluded at compile time. GPIO36 is input-only without internal pull-up; enabled mode uses `INPUT` and relies on Unit Key's internal10kΩ pull-up. No external pull-up is added; do not leave KEY enabled with the unit absent/disconnected.
+
+A30ms non-blocking debounce accepts a press once and rearms only after a debounced release. A key held at boot does not toggle until released and pressed again. KEY calls the same `publishStudyLightToggle()` as C-long: MQTT PRESS, success LED feedback and `/sounds/light-toggle.wav`, with existing failure and audio-busy behavior. KEY works with Display OFF and never wakes the display or updates its inactivity timer. Physical A/B/C wake-only behavior is unchanged. Unit Key's SK6812 is not controlled and GPIO26 is untouched.
+
+Debounced events produce `PERF KEY press t=...`, `PERF KEY action t=...`, and `PERF KEY release t=...`. Action means an attempt; the existing LIGHT log reports MQTT publication success/failure.
+
 ## Optional Port A TMOS unit
 
 TMOS PIR UNIT (STHS34PF80, I²C `0x5A`) shares M5Unified's existing `In_I2C` on Port A (SDA GPIO21 / SCL GPIO22). Unit transactions use 100kHz; the bus is not released or reinitialized, preserving internal IMU communication.
@@ -140,7 +150,7 @@ Connect TMOS (`0x5A`) and DLight/BH1750FVI (`0x23`) to Port A with a Y-GROVE cab
 | DLight | Observe illuminance; continuous high-resolution mode (`0x10`), read every1s; raw16-bit big-endian value /1.2 |
 | Physical C-long | Explicit ceiling-light toggle; existing MQTT, LED and sound |
 
-**TMOS/DLight never control the light or wake/sleep the display.** KEY UNIT is not included in this update; its explicit-input integration remains future work. Gesture remains removed.
+**TMOS/DLight never control the light or wake/sleep the display.** Optional KEY UNIT provides explicit light input when enabled (see above). Gesture remains removed.
 
 | Lux | Light state |
 | --- | --- |
