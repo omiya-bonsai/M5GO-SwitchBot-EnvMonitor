@@ -338,4 +338,4 @@ JetBrains Mono is under SIL OFL 1.1; see [font notice](FONT-NOTICE.md) and [OFL]
 
 ## License
 
-The application code in this repository is licensed under the MIT License. Copyright (c) 2026 omiya-bonsai. See [LICENSE](LICENSE).
+Original application code authored by omiya-bonsai in this repository is licensed under the MIT License (Copyright (c) 2026 omiya-bonsai). Third-party materials are not covered by this license: JetBrains Mono and its generated font headers remain under SIL OFL 1.1. See [LICENSE](LICENSE), the [font notice](FONT-NOTICE.md), and [OFL](OFL-JetBrainsMono.txt).

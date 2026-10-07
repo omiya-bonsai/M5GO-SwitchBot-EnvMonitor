@@ -338,4 +338,4 @@ JetBrains Mono は SIL OFL 1.1 です。[フォント注記](FONT-NOTICE.md) と
 
 ## ライセンス
 
-このリポジトリのアプリケーションコードは MIT License でライセンスされています。Copyright (c) 2026 omiya-bonsai。[LICENSE](LICENSE) を参照してください。
+このリポジトリで omiya-bonsai が作成したアプリケーションコードは、MIT License（Copyright (c) 2026 omiya-bonsai）でライセンスされています。第三者の著作物にはこのライセンスは適用されません。JetBrains Mono およびその生成フォントヘッダーは SIL OFL 1.1 のままです。[LICENSE](LICENSE)、[フォント注記](FONT-NOTICE.md)、[OFL](OFL-JetBrainsMono.txt) を参照してください。
