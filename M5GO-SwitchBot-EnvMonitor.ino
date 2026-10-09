@@ -49,6 +49,10 @@ constexpr int SCREEN_HEIGHT = 240;
 static_assert(DISPLAY_SLEEP_TIMEOUT_SEC >= 0 && uint64_t(DISPLAY_SLEEP_TIMEOUT_SEC) <= UINT32_MAX / 1000UL,
               "DISPLAY_SLEEP_TIMEOUT_SEC must fit in uint32_t milliseconds");
 constexpr uint32_t DISPLAY_SLEEP_MS = uint32_t(DISPLAY_SLEEP_TIMEOUT_SEC) * 1000UL;
+// Solar calculation uses config.h coordinates and local JST (TZ_INFO = JST-9).
+constexpr int DISPLAY_UTC_OFFSET_MIN = 9 * 60;
+constexpr uint8_t DISPLAY_NIGHT_BRIGHTNESS = 15;  // M5GFX: 0..255.
+constexpr uint32_t DISPLAY_NIGHT_TIMEOUT_MS = 30000;
 constexpr uint32_t DISPLAY_REFRESH_MS = 1000UL;
 constexpr uint32_t LONG_PRESS_MS = 800UL;
 
@@ -260,6 +264,11 @@ uint8_t lightFeedbackFrame = 255;
 uint8_t brightnessIndex = App::DEFAULT_BRIGHTNESS_INDEX;
 
 uint32_t lastUserActivityMs = 0;
+// Unknown clock is treated as NIGHT; only manual buttons may wake the LCD.
+bool displayDayMode = false, displayModeInitialized = false;
+uint32_t displayModeUpdatedMs = 0, displayNightActivityMs = 0;
+int displaySolarYear = -1, displaySolarDay = -1;
+int32_t displaySunriseSec = -1, displaySunsetSec = -1;
 uint32_t lastDisplayRefreshMs = 0;
 uint32_t lastHealthLogMs = 0;
 uint32_t lastSdLogMs = 0;
@@ -611,6 +620,63 @@ bool isClockValid() {
 bool getLocalTimeSafe(struct tm& localTime) {
   if (!isClockValid()) return false;
   return getLocalTime(&localTime, 10);
+}
+
+// NOAA fractional-year approximation, local solar times in seconds.
+// https://gml.noaa.gov/grad/solcalc/solareqns.PDF
+bool calculateDisplaySun(const struct tm& date) {
+  const int year = date.tm_year + 1900;
+  const bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+  constexpr float rad = 0.01745329252f;
+  const float gamma = 6.28318530718f * date.tm_yday / (leap ? 366 : 365);
+  const float eq = 229.18f * (0.000075f + 0.001868f*cosf(gamma) - 0.032077f*sinf(gamma) -
+    0.014615f*cosf(2*gamma) - 0.040849f*sinf(2*gamma));
+  const float dec = 0.006918f - 0.399912f*cosf(gamma) + 0.070257f*sinf(gamma) -
+    0.006758f*cosf(2*gamma) + 0.000907f*sinf(2*gamma) -
+    0.002697f*cosf(3*gamma) + 0.00148f*sinf(3*gamma);
+  const float lat = DISPLAY_LATITUDE * rad;
+  const float cosHour = (cosf(90.833f*rad) - sinf(lat)*sinf(dec)) / (cosf(lat)*cosf(dec));
+  if (!isfinite(cosHour) || cosHour <= -1 || cosHour >= 1) return false;
+  const float hour = acosf(cosHour) / rad;
+  const float noon = 720 - 4*DISPLAY_LONGITUDE - eq + App::DISPLAY_UTC_OFFSET_MIN;
+  displaySunriseSec = int32_t((noon - 4*hour)*60 + 0.5f);
+  displaySunsetSec = int32_t((noon + 4*hour)*60 + 0.5f);
+  return displaySunriseSec >= 0 && displaySunsetSec < 86400 && displaySunriseSec < displaySunsetSec;
+}
+void maintainDisplayMode(uint32_t now) {
+  if (displayModeInitialized && uint32_t(now - displayModeUpdatedMs) < 1000) return;
+  displayModeUpdatedMs = now;
+  struct tm date;
+  const time_t epoch = time(nullptr);
+  const bool clockValid = isClockValid() && localtime_r(&epoch, &date);
+  bool newDay = false, newDate = false;
+  if (clockValid) {
+    if (date.tm_year != displaySolarYear || date.tm_yday != displaySolarDay) {
+      displaySolarYear = date.tm_year; displaySolarDay = date.tm_yday;
+      displaySunriseSec = displaySunsetSec = -1;
+      if (!calculateDisplaySun(date)) displaySunriseSec = displaySunsetSec = -1;
+      newDate = true;
+    }
+    const int seconds = date.tm_hour*3600 + date.tm_min*60 + date.tm_sec;
+    newDay = displaySunriseSec >= 0 && seconds >= displaySunriseSec && seconds < displaySunsetSec;
+  } else {
+    displaySolarYear = displaySolarDay = -1;
+  }
+  const bool changed = !displayModeInitialized || newDay != displayDayMode;
+  if (changed && !newDay) {
+    displayNightActivityMs = now;  // Separate from physical activity.
+    if (!displaySleeping) M5.Display.setBrightness(App::DISPLAY_NIGHT_BRIGHTNESS);
+  }
+  displayDayMode = newDay;
+  if (changed && newDay && !displaySleeping) M5.Display.setBrightness(displayWakeBrightness());
+  displayModeInitialized = true;
+  if (changed || newDate) {
+    if (clockValid && displaySunriseSec >= 0) {
+      Serial.printf("[DISPLAY] mode=%s sunrise=%02ld:%02ld sunset=%02ld:%02ld\n",
+        newDay ? "DAY" : "NIGHT", (long)(displaySunriseSec/3600), (long)(displaySunriseSec/60%60),
+        (long)(displaySunsetSec/3600), (long)(displaySunsetSec/60%60));
+    } else Serial.println("[DISPLAY] mode=NIGHT clock/solar unavailable; automatic wake disabled");
+  }
 }
 
 void formatClock(char* buffer, size_t size) {
@@ -1929,6 +1995,7 @@ void maintainImu(uint32_t now) {
 
   // Motion wake while LCD is sleeping.
   if (displaySleeping) {
+    if (!displayDayMode) { previousAccelMagnitude = magnitude; return; }
     if (!isfinite(previousAccelMagnitude)) {
       previousAccelMagnitude = magnitude;
       return;
@@ -2442,6 +2509,7 @@ uint8_t displayBrightnessTarget(uint32_t now) {
   return App::BRIGHTNESS_LEVELS[brightnessIndex];
 }
 void maintainDisplayBrightness(uint32_t now) {
+  if (!displayDayMode) return;
   if (uint32_t(now - displayBrightnessUpdatedMs) < 50) return;
   displayBrightnessUpdatedMs = now;
   const uint8_t target = displayBrightnessTarget(now);
@@ -2454,6 +2522,7 @@ void maintainDisplayBrightness(uint32_t now) {
 }
 #endif
 uint8_t displayWakeBrightness() {
+  if (!displayDayMode) return App::DISPLAY_NIGHT_BRIGHTNESS;
 #if DISPLAY_AUTO_BRIGHTNESS
   // Apply the latest target while OFF, avoiding a bright flash on wake.
   displayAutoBrightness = displayBrightnessTarget(millis());
@@ -2470,6 +2539,7 @@ uint32_t displayOccupancyReleasedMs = 0;
 
 void registerUserActivity() {
   lastUserActivityMs = millis();
+  if (!displayDayMode) displayNightActivityMs = lastUserActivityMs;
 }
 
 void sleepDisplay() {
@@ -2493,7 +2563,7 @@ void wakeDisplay() {
 
   drawScreen();
 
-  Serial.println("Display: wake");
+  Serial.println(displayDayMode ? "Display: wake" : "[DISPLAY] night: manual wake");
 }
 
 void loadUiState() {
@@ -2523,7 +2593,7 @@ void cycleBrightness() {
   brightnessIndex = nextIndex;
 
   M5.Display.setBrightness(
-    App::BRIGHTNESS_LEVELS[brightnessIndex]);
+    displayDayMode ? App::BRIGHTNESS_LEVELS[brightnessIndex] : App::DISPLAY_NIGHT_BRIGHTNESS);
 
   if (preferencesAvailable &&
       preferences.putUChar("brightness", brightnessIndex) != 1) {
@@ -2535,6 +2605,17 @@ void cycleBrightness() {
 }
 
 void maintainDisplaySleep(uint32_t now) {
+  if (!displayDayMode) {
+#if DISPLAY_KEEP_ON_WHEN_OCCUPIED
+    displayOccupancyHeld = false;
+    displayOccupancyReleased = false;
+#endif
+    if (!displaySleeping && uint32_t(now - displayNightActivityMs) >= App::DISPLAY_NIGHT_TIMEOUT_MS) {
+      Serial.println("[DISPLAY] night: timeout -> OFF");
+      sleepDisplay();
+    }
+    return;  // No occupancy wake/keep-on/release timer in NIGHT or unknown time.
+  }
 #if DISPLAY_KEEP_ON_WHEN_OCCUPIED
   // Raw motion never extends the presence hold. A single read error is tolerated
   // only while the last successful TMOS sample is still fresh.
@@ -3002,7 +3083,7 @@ void setupDisplay() {
   loadUiState();
 
   M5.Display.setBrightness(
-    App::BRIGHTNESS_LEVELS[brightnessIndex]);
+    displayDayMode ? App::BRIGHTNESS_LEVELS[brightnessIndex] : App::DISPLAY_NIGHT_BRIGHTNESS);
 
   Serial.printf("Font: %s\n",
                 HAVE_JETBRAINS_MONO
@@ -3077,6 +3158,7 @@ void loop() {
   Perf::lastUpdate = perfUpdate; Perf::haveUpdate = true;
   M5.update();
 
+  maintainDisplayMode(millis());
   processButtons(now);
 #if KEY_UNIT_ENABLED
   maintainKeyUnit();
@@ -3092,6 +3174,7 @@ void loop() {
   maintainLightFeedback(millis());
   maintainLightSound();
 
+  maintainDisplayMode(millis());  // Recheck after synchronous network/SD work.
 #if DISPLAY_AUTO_BRIGHTNESS
   maintainDisplayBrightness(millis());
 #endif

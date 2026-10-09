@@ -16,3 +16,7 @@
 #define DISPLAY_KEEP_ON_WHEN_OCCUPIED 1
 #define DISPLAY_AUTO_BRIGHTNESS 1
 #define DISPLAY_SLEEP_TIMEOUT_SEC 180
+
+// Sample coordinates only; replace with the installation location in config.h.
+#define DISPLAY_LATITUDE 35.0f
+#define DISPLAY_LONGITUDE 139.0f

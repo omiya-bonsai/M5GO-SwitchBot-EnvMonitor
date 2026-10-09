@@ -79,9 +79,11 @@ B 短押しによる循環順序：
 
 保存される手動LCD 輝度は `40 → 80 → 120 → 160 → 220 → 40`。初期値160、NVS（`envmonitor` / `brightness`）へ保存します。点灯中は約1秒ごと、有効な MQTT 受信時、ボタン操作時に描画します。傾斜操作はページ変更とグラフ読み込みを行い、通常の更新で描画されます。
 
-有効な在室Keep-ON中を除き、最後の操作または直近の在室解除から設定時間（既定180秒）でバックライトを消灯します。ボタン、物理ボタン／IMUのWake、成立した傾斜操作が操作時刻を更新します。TMOS Wakeでは更新しません。点灯中の通常の動きや MQTT 受信では更新しません。ESP32 の Sleep ではなく、消灯中も通信・再接続・NTP・SD ログ・IMU・HEALTH 監視を継続します。MQTT 受信で Display を Wake しません。
+DAYモードでは、有効な在室Keep-ON中を除き、最後の操作または直近の在室解除から設定時間（既定180秒）でバックライトを消灯します。ボタン、物理ボタン／IMUのWake、成立した傾斜操作が操作時刻を更新します。TMOS Wakeでは更新しません。点灯中の通常の動きや MQTT 受信では更新しません。ESP32 の Sleep ではなく、消灯中も通信・再接続・NTP・SD ログ・IMU・HEALTH 監視を継続します。MQTT 受信で Display を Wake しません。
 
-`config.h`の`DISPLAY_KEEP_ON_WHEN_OCCUPIED=1`で、有効なTMOS在室中はDisplayを自動ON・保持します。退室後は`DISPLAY_SLEEP_TIMEOUT_SEC`から消灯までをカウントします（既定180秒、0で自動消灯無効）。`DISPLAY_AUTO_BRIGHTNESS=1`でDLight luxに応じてLCD輝度を滑らかに調整し、利用不能時は保存された手動輝度へ戻します。0では従来の手動輝度です。A長押しの手動設定保存は両モードで維持します。
+DAYモードでは`config.h`の`DISPLAY_KEEP_ON_WHEN_OCCUPIED=1`で、有効なTMOS在室中はDisplayを自動ON・保持します。退室後は`DISPLAY_SLEEP_TIMEOUT_SEC`から消灯までをカウントします（既定180秒、0で自動消灯無効）。`DISPLAY_AUTO_BRIGHTNESS=1`でDLight luxに応じてLCD輝度を滑らかに調整し、利用不能時は保存された手動輝度へ戻します。0では従来の手動輝度です。A長押しの手動設定保存は両モードで維持します。
+
+設置地点の日の出・日の入り（JST）でDisplayのDAY／NIGHTを切り替えます。DAYは既存の在室Wake／Keep-ONとDLight輝度を維持します。NIGHTはPIRのWake／Keep-ONとIMUモーションWakeを禁止し、A/B/CのWake-onlyで輝度15・30秒点灯します。有効なA/B/C操作で30秒を延長します。日の入り時に点灯中なら低輝度化して30秒を開始し、消灯中なら消灯を維持します。時刻不明時も安全側のNIGHT制御です。既存NTP時計から日の出・日の入りを毎日近似計算します。日の出・日の入り計算には緯度・経度を使います。`config.example.h`をGit管理対象外の`config.h`へコピーし、`DISPLAY_LATITUDE`と`DISPLAY_LONGITUDE`に設置地点の座標を設定します（テンプレートはサンプル座標です）。夜間輝度と時間はスケッチの`App::DISPLAY_NIGHT_BRIGHTNESS`、`App::DISPLAY_NIGHT_TIMEOUT_MS`で設定します。KEY照明操作・効果音、センサー、MQTTは独立して継続します。
 
 
 ## 再起動後の UI 状態復元（v0.6.1）
